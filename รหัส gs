@@ -1,0 +1,3771 @@
+const SHEET_NAMES = {
+  USERS: 'Users',
+  PROFILES: 'Profiles',
+  ACTIVITIES: 'Activities',
+  REGISTRATIONS: 'ActivityRegistrations',
+  LOAN_ELIGIBLE: 'Eligible_2569',
+  LOAN_REQUESTS: 'LoanRequests_2569',
+  RESIGN_ELIGIBLE: 'ResignEligible',
+  RESIGN_REQUESTS: 'ResignRequests'
+};
+
+const EXTERNAL_LOAN_SHEET_ID = '1qtOSKmsnFR1BKGNqY9D6xJvtkeM0IJSN_hCI9mPqc9g';        // ฐานข้อมูลยื่นกู้ยืมระบบรายชื่อผู้ยื่นกู้
+const EXTERNAL_LOG_SHEET_ID = '10axtjWdwqOuRi1N5nbZbt5U7f2B7zSj3FvP0IFpTYSU';         // ฐานข้อมูลการเข้าใช้งานระบบ
+const EXTERNAL_PETITION_SHEET_ID = '1fYkiLkOuId_LbfcLnB0XNq2VyqdBk2KiAEJTKnXTduA';    // ฐานข้อมูลยื่นคำร้องออนไลน์
+const EXTERNAL_ID_DATABASE_SHEET_ID = '1PwX_5SAU9cxxc6_9dvyoHHCkDm3Gdz4JDwhW0jRt8JY'; // ฐานข้อมูลระบบยืนยันตัวตน
+const EXTERNAL_PROFILE_SHEET_ID = '1_4pN1c4LBxao5ata_N7TvRLo4F1fXsnfCh1YtdsxX7Y';     // ฐานข้อมูลส่วนตัวประวัติ
+
+
+const SHEET_SPECIAL_ACCESS = 'SpecialAccess';
+const SHEET_OVER_ELIGIBLE = 'OverEligible_2569';
+const SHEET_OVER_REQUESTS = 'OverRequests_2569';
+const SHEET_RESIGN_ELIGIBLE_DB = 'ResignEligible';
+const SHEET_RESIGN_REQUESTS_DB = 'ResignRequests';
+const SHEET_RESIGN_ELIGIBLE = 'ResignEligible';
+const SHEET_RESIGN_REQUESTS = 'ResignRequests';
+const SHEET_LOAN_ELIGIBLE = 'Eligible_2569';
+const SHEET_LOAN_REQUESTS = 'LoanRequests_2569';
+
+const MAX_CONCURRENT_USERS = 40;
+const SESSION_TIMEOUT_MINUTES = 10;
+
+function getAdminEmails_() {
+  const adminEmails = [
+    "servicenoreply783@gmail.com",
+    "thapanutputtathakorn@gmail.com",
+    "thapanutputtathakorn242003@gmail.com",
+    "vanvipa.a@ubu.ac.th",
+    "tagsina.sr.67@ubu.ac.th"
+  ];
+  
+  return adminEmails.map(e => e.trim().toLowerCase());
+}
+
+function checkActiveUserLimit_() {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(5000);
+    const cache = CacheService.getScriptCache();
+    const cacheKey = 'active_user_sessions';
+    
+    let sessions = JSON.parse(cache.get(cacheKey) || '[]');
+    const now = new Date().getTime();
+    const timeoutMs = SESSION_TIMEOUT_MINUTES * 60 * 1000;
+    
+    sessions = sessions.filter(timestamp => (now - timestamp) < timeoutMs);
+    
+    if (sessions.length >= MAX_CONCURRENT_USERS) {
+      return { allow: false, count: sessions.length };
+    }
+    
+    sessions.push(now);
+    cache.put(cacheKey, JSON.stringify(sessions), SESSION_TIMEOUT_MINUTES * 60);
+    return { allow: true, count: sessions.length };
+    
+  } catch (e) {
+     return { allow: true, count: 0 };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getSpreadsheetByTarget_(sheetName) {
+  if (sheetName === SHEET_NAMES.PROFILES) {
+    return SpreadsheetApp.openById(EXTERNAL_PROFILE_SHEET_ID);
+  }
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function verifyAdminToken(adminId, token) {
+  if (adminId == null || token == null) {
+    throw new Error("400 Bad Request: ไม่พบข้อมูลยืนยันตัวตน");
+  }
+  
+  const strAdminId = String(adminId).trim();
+  const strToken = String(token).trim();
+
+  if (!strToken || !strAdminId) {
+    logSuspiciousActivity(strAdminId || 'Unknown', 'พยายามเข้าถึงสิทธิ์ Admin โดยไม่มี Token', 'Backend API Call');
+    throw new Error("401 Unauthorized: ปฏิเสธการเข้าถึง กรุณาเข้าสู่ระบบใหม่");
+  }
+
+  const users = getData_(SHEET_NAMES.USERS);
+  const admin = users.find(u => String(u.studentId).trim() === strAdminId);
+
+  if (!admin || admin.sessionToken !== strToken) {
+    logSuspiciousActivity(strAdminId, 'ใช้ Token Admin ไม่ถูกต้อง หรือพยายามสวมรอย', `Token: [HIDDEN]`);
+    throw new Error("401 Unauthorized: เซสชันไม่ถูกต้อง หรือมีการล็อกอินซ้อน กรุณาเข้าสู่ระบบใหม่");
+  }
+  if (String(admin.role).trim().toLowerCase() !== 'admin') {
+    logSuspiciousActivity(strAdminId, 'พยายามใช้สิทธิ์ Admin แต่ระดับผู้ใช้เป็นแค่ User', 'Privilege Escalation Attempt');
+    throw new Error("403 Forbidden: บัญชีของคุณไม่มีสิทธิ์เข้าถึงข้อมูลระดับผู้ดูแลระบบ");
+  }
+
+  const currentEmail = String(admin.gmail).trim().toLowerCase();
+  const allowedEmails = getAdminEmails_();
+  if (!allowedEmails.includes(currentEmail)) {
+    logSuspiciousActivity(strAdminId, 'พยายามใช้สิทธิ์ Admin แต่อีเมลไม่อยู่ในลิสต์อนุญาต', `Email: ${currentEmail}`);
+    throw new Error("403 Forbidden: อีเมลไม่ได้รับอนุญาตให้ใช้สิทธิ์ Admin");
+  }
+
+  if (admin.tokenExpiry) {
+    const now = new Date();
+    const expiryDate = new Date(admin.tokenExpiry);
+    if (isNaN(expiryDate.getTime()) || now > expiryDate) {
+      throw new Error("401 Unauthorized: เซสชันหมดอายุหรือไม่ถูกต้อง กรุณาเข้าสู่ระบบใหม่อีกครั้ง");
+    }
+  }
+  return true;
+}
+
+function verifyUserToken(studentId, token) {
+  if (studentId == null || token == null) {
+    throw new Error("400 Bad Request: ไม่พบข้อมูลยืนยันตัวตน");
+  }
+
+  const strStudentId = String(studentId).trim();
+  const strToken = String(token).trim();
+
+  if (!strToken || !strStudentId) {
+    logSuspiciousActivity(strStudentId || 'Unknown', 'พยายามดึงข้อมูลโดยไม่มี Token (Unauthorized)', 'Backend API Call');
+    throw new Error("401 Unauthorized: ไม่พบ Token กรุณาเข้าสู่ระบบใหม่");
+  }
+  
+  const users = getData_(SHEET_NAMES.USERS);
+  const user = users.find(u => String(u.studentId).trim() === strStudentId);
+  
+  if (!user || user.sessionToken !== strToken) {
+    logSuspiciousActivity(strStudentId, 'ใช้ Token ไม่ถูกต้อง หรือพยายามสวมรอยเซสชัน', `Token ที่ใช้: [HIDDEN]`);
+    throw new Error("401 Unauthorized: เซสชันไม่ถูกต้อง หรือมีการล็อกอินซ้อน กรุณาเข้าสู่ระบบใหม่");
+  }
+  
+  if (user.tokenExpiry) {
+    const now = new Date();
+    const expiryDate = new Date(user.tokenExpiry);
+    if (isNaN(expiryDate.getTime()) || now > expiryDate) {
+      logSuspiciousActivity(strStudentId, 'พยายามใช้งานระบบด้วย Token ที่หมดอายุ', 'System Expired Token');
+      throw new Error("401 Unauthorized: เซสชันหมดอายุแล้ว กรุณาเข้าสู่ระบบใหม่อีกครั้ง");
+    }
+  }
+  return true;
+}
+
+function doGet(e) {
+  let page = e.parameter.page;
+  if (!page || page === 'login') {
+    return HtmlService.createTemplateFromFile('View_Login').evaluate()
+        .setTitle('ระบบ กยศ. - เข้าสู่ระบบ')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1.0');
+  } 
+  else if (page === 'user') {
+    return HtmlService.createTemplateFromFile('View_User').evaluate()
+        .setTitle('ระบบ กยศ. - นักศึกษา')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1.0');
+  } 
+  else if (page === 'admin') {
+    return HtmlService.createTemplateFromFile('View_Admin').evaluate()
+        .setTitle('ระบบ กยศ. - ผู้ดูแลระบบ')
+        .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+        .addMetaTag('viewport', 'width=device-width, initial-scale=1.0');
+  }
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function secureInput(input, maxLength = 1000) {
+  if (input === undefined || input === null) return '';
+  let sanitized = String(input).trim().substring(0, maxLength);
+  sanitized = sanitized.replace(/&/g, '&amp;')
+                       .replace(/</g, '&lt;')
+                       .replace(/>/g, '&gt;')
+                       .replace(/"/g, '&quot;')
+                       .replace(/'/g, '&#x27;');
+  if (/^[=+\-@]/.test(sanitized)) {
+    sanitized = "'" + sanitized;
+  }
+  return sanitized;
+}
+
+function generateId(prefix = '') {
+  return prefix + Utilities.getUuid().replace(/-/g, '');
+}
+
+function hashPassword(password, salt = '') {
+  let hashStr = password + String(salt); 
+  for (let loop = 0; loop < 1000; loop++) {
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, hashStr);
+    let hexString = '';
+    for (let i = 0; i < digest.length; i++) {
+      const byte = digest[i];
+      hexString += (byte < 0 ? byte + 256 : byte).toString(16).padStart(2, '0');
+    }
+    hashStr = hexString;
+  }
+  return hashStr;
+}
+
+function verifyPassword(plainPassword, hashedPassword, salt = '') {
+  return hashPassword(plainPassword, salt) === hashedPassword;
+}
+
+function getData_(sheetName) {
+  const ss = getSpreadsheetByTarget_(sheetName); 
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return [];
+  const range = sheet.getDataRange();
+  const values = range.getValues(); 
+  if (values.length === 0) return [];
+  
+  const headers = values[0].map(h => String(h).trim());
+  const data = [];
+  
+  for (let i = 1; i < values.length; i++) {
+    const row = {};
+    for (let j = 0; j < headers.length; j++) {
+      let value = values[i][j];
+      if (value instanceof Date) {
+         const year = value.getFullYear();
+         const month = String(value.getMonth() + 1).padStart(2, '0');
+         const day = String(value.getDate()).padStart(2, '0');
+         value = `${year}-${month}-${day}`;
+      } 
+      else if ((headers[j] === 'date' || headers[j] === 'dob') && typeof value === 'string' && value) {
+         let normalizedDate = value.startsWith("'") ? value.slice(1) : value;
+         const dateMatch = normalizedDate.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/); 
+         if (dateMatch) {
+           const year = dateMatch[3];
+           const month = dateMatch[2].padStart(2, '0');
+           const day = dateMatch[1].padStart(2, '0');
+           value = `${year}-${month}-${day}`;
+         }
+      }
+      row[headers[j]] = value === undefined || value === null ? '' : value;
+    }
+    row['_rowIndex'] = i + 1; 
+    data.push(row);
+  }
+  return data;
+}
+
+function appendRow_(sheetName, rowData) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = getSpreadsheetByTarget_(sheetName); 
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return null;
+    
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const newRow = Array(headers.length).fill('');
+    const id = generateId(sheetName.substring(0, 3).toLowerCase() + '-');
+    const now = new Date().toISOString();
+
+    for (let i = 0; i < headers.length; i++) {
+      const header = headers[i];
+      if (header === 'id') newRow[i] = id;
+      else if (['createdAt', 'registeredAt', 'updatedAt'].includes(header)) newRow[i] = now;
+      else if (['phone', 'idCard', 'fatherPhone', 'motherPhone'].includes(header) && rowData[header]) {
+        newRow[i] = `'${secureInput(rowData[header])}`;
+      } else if (rowData.hasOwnProperty(header)) {
+        newRow[i] = secureInput(rowData[header]);
+      }
+    }
+    sheet.appendRow(newRow);
+    SpreadsheetApp.flush();
+    return { ...rowData, id: id, updatedAt: now };
+  } catch (e) {
+    return null;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function updateRow_(sheetName, id, updatedData) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = getSpreadsheetByTarget_(sheetName); 
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return null;
+
+    const data = getData_(sheetName);
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]; 
+    let rowIndex = -1;
+    for(let i=0; i<data.length; i++) {
+      if(data[i].id === id) {
+        rowIndex = i + 2;
+        break;
+      }
+    }
+    if (rowIndex === -1) return null;
+    const existingRow = data[rowIndex - 2];
+    const newRowObj = { ...existingRow, ...updatedData, updatedAt: new Date().toISOString() };
+    const rowValues = [];
+    for(let i=0; i<headers.length; i++) {
+        let header = headers[i];
+        let val = newRowObj[header] || '';
+        if (['phone', 'idCard', 'fatherPhone', 'motherPhone'].includes(header) && val) {
+            let cleanNum = String(val).replace(/[^0-9]/g, ""); 
+            rowValues.push(`'${cleanNum}`); 
+        } else {
+            rowValues.push(secureInput(val));
+        }
+    }
+    sheet.getRange(rowIndex, 1, 1, headers.length).setValues([rowValues]);
+    SpreadsheetApp.flush();
+    return newRowObj;
+  } catch (e) {
+    return null;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteRow_(sheetName, id) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = getSpreadsheetByTarget_(sheetName); 
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return false;
+    const data = sheet.getDataRange().getValues();
+    const idIndex = data[0].indexOf('id');
+    if (idIndex === -1) return false;
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][idIndex] === id) {
+        sheet.deleteRow(i + 1);
+        SpreadsheetApp.flush();
+        return true;
+      }
+    }
+    return false;
+  } catch (e) {
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function checkLoginAttempts_(studentId) {
+  const cache = CacheService.getScriptCache();
+  const key = 'login_fail_' + studentId;
+  const raw = cache.get(key);
+  if (!raw) return { blocked: false, count: 0 };
+  const count = parseInt(raw, 10);
+  return { blocked: count >= 5, count: count };
+}
+
+function recordFailedLogin_(studentId) {
+  const cache = CacheService.getScriptCache();
+  const key = 'login_fail_' + studentId;
+  let count = parseInt(cache.get(key) || '0', 10);
+  count++;
+  cache.put(key, count.toString(), 900);
+}
+
+function clearLoginAttempts_(studentId) {
+  const cache = CacheService.getScriptCache();
+  const key = 'login_fail_' + studentId;
+  cache.remove(key);
+}
+
+function login(studentId, password, ipAddress) {
+  const currentIp = ipAddress || "Unknown";
+  const attempt = checkLoginAttempts_(studentId);
+  
+  if (attempt.blocked) {
+    return { success: false, message: 'การเข้าสู่ระบบถูกระงับชั่วคราว 15 นาที เนื่องจากกรอกรหัสผ่านผิดหลายครั้งเกินไป' };
+  }
+
+  const users = getData_(SHEET_NAMES.USERS);
+  const user = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+  
+  if (!user) {
+    recordSystemLog(studentId, "Unknown", "Login Failed: User Not Found", currentIp);
+    return { success: false, message: 'ไม่พบผู้ใช้งานในฐานข้อมูลระบบ' };
+  }
+
+  if (user.status === 'Suspended') {
+    const fullName = `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim();
+    recordSystemLog(user.studentId, fullName, "Login Failed: Account Suspended", currentIp);
+    return { success: false, message: user.suspendReason || 'บัญชีถูกระงับ' };
+  }
+
+  const isAdmin = String(user.role).trim().toLowerCase() === 'admin';
+
+  if (!isAdmin) {
+     const limitCheck = checkActiveUserLimit_();
+     if (!limitCheck.allow) {
+        return { 
+            success: false,
+            isQueueFull: true, 
+            message: `ขณะนี้มีผู้ใช้งานระบบพร้อมกันเป็นจำนวนมาก ส่งผลให้จำนวนการเข้าใช้งานถึงระดับที่กำหนดไว้ชั่วคราว จึงไม่สามารถดำเนินการเข้าสู่ระบบเพิ่มเติมได้ในขณะนี้ กรุณาลองเข้าใช้งานอีกครั้งภายใน 5–10 นาที ` 
+        };
+     }
+  }
+
+  if (isAdmin) {
+    const currentEmail = String(user.gmail).trim().toLowerCase();
+    const allowedEmails = getAdminEmails_();
+    
+    if (!allowedEmails.includes(currentEmail)) {
+      const fullName = `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim();
+      recordSystemLog(user.studentId, fullName, "Login Failed: Unauthorized Admin Email", currentIp);
+      return {
+        success: false,
+        isUnauthorizedAdmin: true,
+        message: 'อีเมลของบัญชีนี้ ไม่ได้รับอนุญาตให้เข้าสู่ระบบผู้ดูแลระบบ'
+      };
+    }
+  }
+
+  let userSalt = user.salt ? user.salt : user.studentId;
+  let isPasswordValid = verifyPassword(password, user.password, userSalt);
+  let needsHashUpgrade = false;
+
+  if (!isPasswordValid && !user.salt) {
+    if (password === user.password) {
+      isPasswordValid = true;
+    } else {
+      isPasswordValid = verifyPassword(password, user.password, '');
+    }
+  }
+
+  if (isPasswordValid && !user.salt) {
+    needsHashUpgrade = true;
+  }
+
+  if (isPasswordValid) {
+    clearLoginAttempts_(studentId);
+    const sessionToken = generateId('TK-');
+    const expiryTime = new Date();
+    expiryTime.setHours(expiryTime.getHours() + 24);
+
+    let updateData = {
+      sessionToken: sessionToken,
+      tokenExpiry: expiryTime.toISOString()
+    };
+    
+    if (needsHashUpgrade) {
+      const freshSalt = Utilities.getUuid();
+      updateData.salt = freshSalt;
+      updateData.password = hashPassword(password, freshSalt);
+    }
+
+    updateRow_(SHEET_NAMES.USERS, user.id, updateData);
+    const fullName = `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim();
+    recordSystemLog(user.studentId, fullName, "Login Success", currentIp);
+    
+    const safeUserData = {
+      studentId: user.studentId,
+      prefix: user.prefix || '',
+      firstName: user.firstName,
+      lastName: user.lastName,
+      faculty: user.faculty || '-',
+      gmail: user.gmail || '-',
+      profileImage: user.profileImage || '',
+      role: user.role,
+      token: sessionToken
+    };
+    return { success: true, message: 'เข้าสู่ระบบสำเร็จ', user: safeUserData };
+  }
+
+  recordFailedLogin_(studentId);
+  const fullName = `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim();
+  recordSystemLog(user.studentId, fullName, "Login Failed: Wrong Password", currentIp);
+  return { success: false, message: 'รหัสผ่านไม่ถูกต้อง' };
+}
+
+function signUp(userData) {
+  if (!userData || !userData.studentId || !userData.password || String(userData.password).trim().length < 6) {
+    return { success: false, message: 'ข้อมูลไม่ครบถ้วน หรือรหัสผ่านสั้นเกินไป (ต้องไม่ต่ำกว่า 6 ตัวอักษร)' };
+  }
+
+  userData.studentId = String(userData.studentId).trim();
+  const users = getData_(SHEET_NAMES.USERS);
+  if (users.find(u => String(u.studentId) === userData.studentId || String(u.gmail) === String(userData.gmail).trim())) {
+    return { success: false, message: 'รหัสนักศึกษาหรือบัญชีอีเมลนี้ถูกลงทะเบียนใช้งานแล้ว' };
+  }
+  
+  const newSalt = Utilities.getUuid();
+  userData.salt = newSalt;
+  userData.password = hashPassword(userData.password, newSalt); 
+  userData.role = 'user';
+  userData.status = 'Active';        
+  userData.suspendReason = '';       
+
+  const newUser = appendRow_(SHEET_NAMES.USERS, userData);
+  if (newUser) {
+    delete newUser.password;
+    delete newUser.salt;
+    return { success: true, message: 'ลงทะเบียนขอสิทธิ์ใช้งานสำเร็จ', user: newUser };
+  }
+  return { success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน' };
+}
+
+function resetPassword(data) {
+  if (!data.newPassword || String(data.newPassword).trim().length < 6) {
+    return { success: false, message: 'รหัสผ่านใหม่ต้องมีความยาวไม่ต่ำกว่า 6 ตัวอักษร' };
+  }
+
+  const verifyResult = verifyUserForReset(data.studentId, data.phone, data.idCard);
+  if (!verifyResult.success) {
+      return verifyResult; 
+  }
+
+  const users = getData_(SHEET_NAMES.USERS);
+  const targetUser = users.find(u => String(u.studentId).trim() === String(data.studentId).trim());
+
+  if (!targetUser) return { success: false, message: 'ไม่พบข้อมูลรหัสนักศึกษาในระบบ' };
+
+  const freshSalt = Utilities.getUuid();
+  const newPasswordHash = hashPassword(data.newPassword, freshSalt);
+  const result = updateRow_(SHEET_NAMES.USERS, targetUser.id, { 
+      password: newPasswordHash, 
+      salt: freshSalt 
+  });
+
+  if (result) {
+      const name = `${targetUser.prefix || ''}${targetUser.firstName} ${targetUser.lastName}`.trim();
+      recordSystemLog(data.studentId, name, "รีเซ็ตรหัสผ่านสำเร็จ", "Web App");
+      return { success: true, message: 'เปลี่ยนรหัสผ่านสำเร็จ กรุณาเข้าสู่ระบบด้วยรหัสผ่านใหม่' };
+  }
+  return { success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาลองใหม่อีกครั้ง' };
+}
+
+function verifyUserForReset(studentId, phone, idCard) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const userSheet = ss.getSheetByName('Users'); 
+    if (!userSheet) throw new Error("ไม่พบข้อมูลผู้ใช้งาน");
+    
+    const headers = userSheet.getRange(1, 1, 1, userSheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    const COL_ID = headers.indexOf('studentId');
+    const COL_PHONE = headers.indexOf('phone');
+    const COL_STATUS = headers.indexOf('status');
+    const COL_REASON = headers.indexOf('suspendReason');
+    
+    let COL_FAIL = headers.indexOf('FailedAttempts');
+    if (COL_FAIL === -1) COL_FAIL = headers.indexOf('failedAttempts');
+
+    if (COL_FAIL === -1) {
+      COL_FAIL = headers.length;
+      userSheet.getRange(1, COL_FAIL + 1).setValue('FailedAttempts');
+      SpreadsheetApp.flush();
+    }
+
+    const userData = userSheet.getDataRange().getDisplayValues();
+    const MAX_ATTEMPTS = 5;
+
+    let userRow = -1;
+    let uData = null;
+
+    for (let i = 1; i < userData.length; i++) {
+      if (String(userData[i][COL_ID]).trim() === String(studentId).trim()) {
+        userRow = i + 1;
+        uData = userData[i];
+        break;
+      }
+    }
+    
+    if (userRow === -1) throw new Error("ไม่พบบัญชีผู้ใช้งานนี้ในระบบ");
+
+    if (String(uData[COL_STATUS]).trim() === 'Suspended') {
+      throw new Error("บัญชีของคุณถูกระงับการใช้งานอยู่ ไม่สามารถรีเซ็ตรหัสผ่านได้ กรุณาติดต่อสถานศึกษา");
+    }
+
+    let failedCount = parseInt(uData[COL_FAIL]) || 0;
+    let isPhoneMatched = (String(uData[COL_PHONE]).trim() === String(phone).trim());
+
+
+    const extSS = SpreadsheetApp.openById(EXTERNAL_ID_DATABASE_SHEET_ID);
+    const idSheet = extSS.getSheetByName('ID_Database'); 
+    if (!idSheet) throw new Error("500 Internal Server Error ระบบข้อมูลบัตรประชาชนขัดข้อง");
+    
+    const idData = idSheet.getDataRange().getDisplayValues();
+    let isIdMatched = false;
+    
+    for (let i = 0; i < idData.length; i++) {
+      if (String(idData[i][0]).trim() === String(studentId).trim()) {
+        if (String(idData[i][1]).trim() === String(idCard).trim()) {
+          isIdMatched = true;
+        }
+        break;
+      }
+    }
+
+    if (!isPhoneMatched || !isIdMatched) {
+      failedCount += 1;
+      userSheet.getRange(userRow, COL_FAIL + 1).setValue(failedCount);
+      
+      if (failedCount >= MAX_ATTEMPTS) {
+        userSheet.getRange(userRow, COL_STATUS + 1).setValue('Suspended');
+        userSheet.getRange(userRow, COL_REASON + 1).setValue(`ระบบระงับอัตโนมัติ: ข้อมูลยืนยันตัวตนผิดเกิน ${MAX_ATTEMPTS} ครั้ง`);
+        throw new Error(`ระงับบัญชีอัตโนมัติ: ผู้ใช้งานกรอกข้อมูลผิดครบ ${MAX_ATTEMPTS} ครั้ง กรุณาติดต่อเจ้าหน้าที่เพื่อปลดล็อก`);
+      }
+      throw new Error(`ข้อมูลยืนยันตัวตนไม่ถูกต้อง (ผิดไปแล้ว ${failedCount}/${MAX_ATTEMPTS} ครั้ง)`);
+    }
+
+    if (failedCount > 0) {
+      userSheet.getRange(userRow, COL_FAIL + 1).setValue(0);
+    }
+
+    return { success: true, message: "ข้อมูลถูกต้อง อนุญาตให้เปลี่ยนรหัสผ่านได้" };
+
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+}
+  
+function getProfile(studentId, param2, param3) {
+  let token = param3 ? param3 : param2;
+  let adminId = param3 ? param2 : null;
+  
+  if (adminId) {
+     verifyAdminToken(adminId, token); 
+  } else {
+     verifyUserToken(studentId, token); 
+  }
+  
+  const profiles = getData_(SHEET_NAMES.PROFILES);
+  const profile = profiles.find(p => String(p.studentId).trim() === String(studentId).trim());
+  
+  if (!profile) return null;
+
+  return {
+    studentId: profile.studentId,
+    idCard: profile.idCard,
+    nickname: profile.nickname,
+    dob: profile.dob,
+    phone: profile.phone,
+    gpa: profile.gpa,
+    disease: profile.disease,
+    fatherName: profile.fatherName,
+    fatherJob: profile.fatherJob,
+    fatherPhone: profile.fatherPhone,
+    motherName: profile.motherName,
+    motherJob: profile.motherJob,
+    motherPhone: profile.motherPhone,
+    parentsStatus: profile.parentsStatus,
+    familyMembers: profile.familyMembers,
+    householdIncome: profile.householdIncome,
+    debt: profile.debt,
+    addrNo: profile.addrNo,
+    subDistrict: profile.subDistrict,
+    district: profile.district,
+    province: profile.province,
+    zipcode: profile.zipcode,
+    mapLink: profile.mapLink,
+    updatedAt: profile.updatedAt
+  };
+}
+
+function saveProfile(profileData, param2, param3) {
+  let token = param3 ? param3 : param2;
+  let adminId = param3 ? param2 : null;
+  
+  if (adminId) {
+     verifyAdminToken(adminId, token); 
+  } else {
+     verifyUserToken(profileData.studentId, token);
+  }
+
+  try {
+    const safeData = {
+      studentId: profileData.studentId,
+      idCard: profileData.idCard,
+      nickname: profileData.nickname,
+      dob: profileData.dob,
+      phone: profileData.phone,
+      gpa: profileData.gpa,
+      disease: profileData.disease,
+      fatherName: profileData.fatherName,
+      fatherJob: profileData.fatherJob,
+      fatherPhone: profileData.fatherPhone,
+      motherName: profileData.motherName,
+      motherJob: profileData.motherJob,
+      motherPhone: profileData.motherPhone,
+      parentsStatus: profileData.parentsStatus,
+      familyMembers: profileData.familyMembers,
+      householdIncome: profileData.householdIncome,
+      debt: profileData.debt,
+      addrNo: profileData.addrNo,
+      subDistrict: profileData.subDistrict,
+      district: profileData.district,
+      province: profileData.province,
+      zipcode: profileData.zipcode,
+      mapLink: profileData.mapLink
+    };
+
+    const profiles = getData_(SHEET_NAMES.PROFILES);
+    const existingProfile = profiles.find(p => String(p.studentId).trim() === String(profileData.studentId).trim());
+    const nicknameLog = safeData.nickname || "ไม่ระบุชื่อเล่น";
+
+    if (existingProfile) {
+      const result = updateRow_(SHEET_NAMES.PROFILES, existingProfile.id, safeData);
+      recordSystemLog(safeData.studentId, nicknameLog, "อัปเดตข้อมูลประวัติส่วนตัว", "Web App");
+      return { success: true, message: 'ปรับปรุงข้อมูลสำเร็จ', data: result };
+    } else {
+      const result = appendRow_(SHEET_NAMES.PROFILES, safeData);
+      recordSystemLog(safeData.studentId, nicknameLog, "สร้างข้อมูลประวัติส่วนตัวครั้งแรก", "Web App");
+      return { success: true, message: 'บันทึกข้อมูลสำเร็จ', data: result };
+    }
+  } catch (e) {
+    return { success: false, message: 'ระบบประมวลผลข้อมูลส่วนตัวขัดข้อง กรุณาลองใหม่อีกครั้ง' };
+  }
+}
+
+function uploadProfileImage(data) {
+  verifyUserToken(data.studentId, data.token); 
+  try {
+    if (!data.base64) return { success: false, message: 'ไม่มีข้อมูลไฟล์ถูกส่งมา' };
+
+    if (data.base64.length > 2800000) {
+      return { success: false, message: 'ความปลอดภัย: ขนาดไฟล์รูปภาพใหญ่เกิน 2MB ไม่อนุญาตให้อัปโหลด' };
+    }
+
+    const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
+    const contentType = data.mimeType || 'image/jpeg';
+    
+    const validExtensions = /\.(jpg|jpeg|png|webp)$/i;
+    if (!validExtensions.test(data.fileName) || !allowedMimeTypes.includes(contentType.toLowerCase())) {
+        return { success: false, message: 'ความปลอดภัย: ระบบอนุญาตให้อัปโหลดเฉพาะไฟล์รูปภาพ (JPG, PNG, WEBP) เท่านั้น' };
+    }
+
+    const header = data.base64.substring(0, 15);
+    const isJPEG = header.startsWith('/9j/');
+    const isPNG = header.startsWith('iVBORw0KGgo');
+    const isWEBP = header.startsWith('UklGR');
+    
+    if (!isJPEG && !isPNG && !isWEBP) {
+        return { success: false, message: 'ความปลอดภัย: ตรวจพบเนื้อหาไฟล์ไม่ถูกต้อง' };
+    }
+
+    const FOLDER_ID = PropertiesService.getScriptProperties().getProperty('FOLDER_ID') || "1JEZUKtM6x7UF-S-rnkfp-cEBBDXEwD-U"; 
+    const folder = DriveApp.getFolderById(FOLDER_ID);
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.base64), contentType, data.fileName);
+    const file = folder.createFile(blob);
+    const fileId = file.getId();
+    
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.USERS);
+    const usersData = getData_(SHEET_NAMES.USERS);
+    const targetUser = usersData.find(u => String(u.studentId) === String(data.studentId));
+
+    if (!targetUser) {
+        file.setTrashed(true); 
+        return { success: false, message: 'ไม่พบรหัสนักศึกษาในฐานข้อมูลระบบ' };
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    let colIndex = headers.indexOf('profileImage');
+    
+    if (colIndex === -1) {
+      colIndex = headers.length;
+      sheet.getRange(1, colIndex + 1).setValue('profileImage'); 
+    }
+
+    sheet.getRange(targetUser._rowIndex, colIndex + 1).setValue(fileId);
+
+    let historySheet = ss.getSheetByName('ProfileImageHistory');
+    if (!historySheet) {
+      historySheet = ss.insertSheet('ProfileImageHistory');
+      historySheet.appendRow(['id', 'studentId', 'imageUrl', 'timestamp']);
+      historySheet.getRange("A1:D1").setFontWeight("bold").setBackground("#e0f7fa");
+      historySheet.setFrozenRows(1);
+    }
+    historySheet.appendRow([Utilities.getUuid(), data.studentId, fileId, new Date().toISOString()]);
+
+    return { success: true, imageUrl: fileId, message: 'อัปโหลดรูปภาพสำเร็จ' };
+  } catch (e) {
+    return { success: false, message: 'ไม่สามารถอัปโหลดรูปภาพได้ในขณะนี้' };
+  }
+}
+
+function searchUsersBackend(query, adminId, token) {
+  verifyAdminToken(adminId, token);
+
+  const users = getData_(SHEET_NAMES.USERS);
+  if (!query) return [];
+
+  const lowerQuery = String(query).toLowerCase().trim();
+
+  let results = [];
+  for (let i = 0; i < users.length; i++) {
+    const u = users[i];
+    if (String(u.studentId).toLowerCase().includes(lowerQuery) || 
+        String(u.firstName).toLowerCase().includes(lowerQuery) || 
+        String(u.lastName).toLowerCase().includes(lowerQuery)) {
+        
+        delete u.password; 
+        delete u.sessionToken; 
+        delete u.salt; 
+        results.push(u);
+    }
+    if (results.length >= 50) break;
+  }
+  return results;
+}
+
+function createUser(userData, adminId, token) {
+  verifyAdminToken(adminId, token);
+  return signUp(userData); 
+}
+
+function updateUser(userId, updatedData, adminId, token) {
+ verifyAdminToken(adminId, token);
+
+ if (updatedData.password && String(updatedData.password).trim() !== '') {
+  const users = getData_(SHEET_NAMES.USERS);
+  const targetUser = users.find(u => String(u.id) === String(userId));
+  if(targetUser) {
+    const freshSalt = Utilities.getUuid();
+    updatedData.salt = freshSalt;
+    updatedData.password = hashPassword(updatedData.password, freshSalt);
+  }
+ } else {
+    delete updatedData.password;
+    delete updatedData.salt;
+ }
+
+ if (updatedData.status === 'Active') {
+    updatedData.suspendReason = '';
+    updatedData.FailedAttempts = 0; 
+    updatedData.failedAttempts = 0; 
+ }
+
+ const result = updateRow_(SHEET_NAMES.USERS, userId, updatedData);
+ if (result) {
+  delete result.password;
+  clearLoginAttempts_(result.studentId);
+  return { success: true, message: 'อัปเดตสำเร็จ', user: result };
+ }
+ return { success: false, message: 'อัปเดตล้มเหลว' };
+}
+
+function deleteUser(userId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  if (deleteRow_(SHEET_NAMES.USERS, userId)) return { success: true, message: 'ลบสำเร็จ' }; 
+  return { success: false, message: 'ลบล้มเหลว' };
+}
+
+function deleteMultipleUsers(userIds, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.USERS);
+    if (!sheet) return { success: false, message: 'ไม่พบฐานข้อมูลผู้ใช้' };
+    
+    const data = sheet.getDataRange().getValues();
+    const idIndex = data[0].indexOf('id'); 
+    if (idIndex === -1) return { success: false, message: 'ไม่พบ ID ในฐานข้อมูล' };
+
+    let rowsToDelete = [];
+    for (let i = 1; i < data.length; i++) {
+      if (userIds.includes(String(data[i][idIndex]))) {
+        rowsToDelete.push(i + 1); 
+      }
+    }
+
+    rowsToDelete.sort((a, b) => b - a);
+    rowsToDelete.forEach(rowIndex => {
+      sheet.deleteRow(rowIndex);
+    });
+
+    SpreadsheetApp.flush();
+    return { success: true };
+    
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getProfileSummaries(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const users = getData_(SHEET_NAMES.USERS);
+    const profiles = getData_(SHEET_NAMES.PROFILES);
+    
+    const students = users.filter(u => String(u.role).trim() === 'user');
+    
+    const summaries = students.map(u => {
+      const profile = profiles.find(p => String(p.studentId).trim() === String(u.studentId).trim());
+      
+      return {
+        studentId: u.studentId,
+        name: `${u.prefix || ''}${u.firstName} ${u.lastName}`.trim(),
+        faculty: u.faculty || '-',
+        hasProfile: !!profile, 
+        updatedAt: profile && profile.updatedAt ? profile.updatedAt : '-'
+      };
+    });
+
+    return summaries;
+
+  } catch (error) {
+    return []; 
+  }
+}
+
+function getSuspendedUsers(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const users = getData_(SHEET_NAMES.USERS);
+  
+  const suspendedList = users.filter(u => String(u.status).trim() === 'Suspended');
+  
+  return suspendedList.map(u => ({
+    id: u.id,
+    studentId: u.studentId,
+    name: `${u.prefix || ''}${u.firstName} ${u.lastName}`.trim(),
+    faculty: u.faculty || '-',
+    suspendReason: u.suspendReason || '-',
+    failedAttempts: u.FailedAttempts || u.failedAttempts || 0,
+    status: u.status
+  }));
+}
+
+function searchProfilesBackend(query, adminId, token) {
+  verifyAdminToken(adminId, token);
+  if (!query) return [];
+  
+  const users = getData_(SHEET_NAMES.USERS);
+  const profiles = getData_(SHEET_NAMES.PROFILES);
+  const lowerQuery = String(query).toLowerCase().trim();
+  
+  let results = [];
+  
+  for (let i = 0; i < users.length; i++) {
+    const u = users[i];
+    if (String(u.role).trim() === 'admin') continue;
+    
+    const name = `${u.prefix || ''}${u.firstName} ${u.lastName}`;
+    
+    if (String(u.studentId).toLowerCase().includes(lowerQuery) || name.toLowerCase().includes(lowerQuery)) {
+       const profile = profiles.find(p => String(p.studentId) === String(u.studentId));
+       results.push({
+         studentId: u.studentId,
+         name: name,
+         faculty: u.faculty,
+         hasProfile: !!profile, 
+         updatedAt: profile ? profile.updatedAt : '-'
+       });
+    }
+    
+    if (results.length >= 50) break; 
+  }
+  
+  return results;
+}
+
+function getStudentImageReport(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const users = getData_(SHEET_NAMES.USERS);
+  const profiles = getData_(SHEET_NAMES.PROFILES);
+  const result = [];
+
+  users.filter(u => String(u.role).trim() !== 'admin').forEach(u => {
+    const profile = profiles.find(p => String(p.studentId) === String(u.studentId));
+    result.push({
+      studentId: u.studentId,
+      name: `${u.prefix || ''}${u.firstName} ${u.lastName}`.trim(),
+      idCard: profile && profile.idCard ? String(profile.idCard).replace(/'/g, "") : '-',
+      faculty: u.faculty || '-',
+      profileImage: u.profileImage || null
+    });
+  });
+
+  return result.sort((a, b) => String(a.studentId).localeCompare(String(b.studentId)));
+}
+
+function getProfileImageHistory(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('ProfileImageHistory');
+  if (!sheet) return [];
+
+  const history = getData_('ProfileImageHistory');
+  return history
+    .filter(h => String(h.studentId).trim() === String(studentId).trim())
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+}
+
+function getDashboardStats(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const userSheet = ss.getSheetByName('Users');
+  const regSheet = ss.getSheetByName('ActivityRegistrations'); 
+
+  let totalUsers = 0;
+  let maleCount = 0;
+  let femaleCount = 0;
+
+  if (userSheet && userSheet.getLastRow() > 1) {
+    const data = userSheet.getDataRange().getValues().slice(1);
+    data.forEach(row => {
+      const role = String(row[9]).trim().toLowerCase();
+      const prefix = String(row[2]).trim();
+
+      if (role === 'user') { 
+        totalUsers++;
+        
+        if (prefix === 'นาย') {
+          maleCount++;
+        } else if (prefix === 'นาง' || prefix === 'นางสาว') {
+          femaleCount++;
+        }
+      }
+    });
+  }
+
+  let confirmedCount = 0;
+  if (regSheet && regSheet.getLastRow() > 1) {
+    confirmedCount = regSheet.getLastRow() - 1; 
+  }
+
+  return {
+    success: true,
+    stats: {
+      totalUsers: totalUsers,
+      male: maleCount,
+      female: femaleCount,
+      confirmedRegistrations: confirmedCount
+    }
+  };
+}
+
+function createActivity(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Activities') || ss.insertSheet('Activities');
+  
+  data.periods.forEach(item => {
+    const id = Utilities.getUuid();
+    const createdAt = new Date();
+    sheet.appendRow([
+      id, secureInput(data.name), data.date, item.time,     
+      secureInput(data.location), item.quota, createdAt, 'Show'
+    ]);
+  });
+  return { success: true };
+}
+
+function updateActivity(data, adminId, token) {
+  verifyAdminToken(adminId, token); 
+  const lock = LockService.getScriptLock(); 
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Activities');
+    const rows = sheet.getDataRange().getValues();
+    
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(data.id)) {
+        sheet.getRange(i + 1, 2).setValue(secureInput(data.name));
+        sheet.getRange(i + 1, 3).setValue(secureInput(data.date));
+        sheet.getRange(i + 1, 4).setValue(secureInput(data.period)); 
+        sheet.getRange(i + 1, 5).setValue(secureInput(data.location));
+        sheet.getRange(i + 1, 6).setValue(secureInput(data.quota));
+        SpreadsheetApp.flush(); 
+        return { success: true };
+      }
+    }
+    return { success: false, message: 'ไม่พบกิจกรรม' };
+  } catch(e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function toggleActivityStatus(id, currentStatus, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Activities');
+    const rows = sheet.getDataRange().getValues();
+    const newStatus = (currentStatus === 'Show') ? 'Hide' : 'Show';
+    
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(id)) {
+        sheet.getRange(i + 1, 8).setValue(newStatus); 
+        SpreadsheetApp.flush();
+        return { success: true, newStatus: newStatus };
+      }
+    }
+    return { success: false, message: 'ไม่พบกิจกรรมที่ต้องการเปลี่ยนสถานะ' };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getActivities(mode, studentId, token) {
+  if (mode === 'admin') {
+     verifyAdminToken(studentId, token); 
+  } else if (mode === 'user') {
+     verifyUserToken(studentId, token); 
+  } else {
+     throw new Error("403 Forbidden: ปฏิเสธการเข้าถึง (Invalid Mode)");
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const actSheet = ss.getSheetByName('Activities');
+  const regSheet = ss.getSheetByName('ActivityRegistrations');
+  if (!actSheet) return [];
+  const acts = actSheet.getDataRange().getValues().slice(1);
+  const regs = (regSheet && regSheet.getLastRow() > 1) ? regSheet.getDataRange().getValues().slice(1) : [];
+  const counts = {};
+  const userRegisteredActs = new Set();
+  const strStudentId = String(studentId);
+
+  regs.forEach(r => {
+    const actId = String(r[0]);
+    counts[actId] = (counts[actId] || 0) + 1;
+    if (strStudentId && String(r[1]) === strStudentId) {
+      userRegisteredActs.add(actId);
+    }
+  });
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const result = [];
+
+  acts.forEach(row => {
+    const status = row[7] || 'Show'; 
+    if (mode === 'user' && status === 'Hide') return;
+
+    let dateStr = row[2];
+    if (row[2] instanceof Date) {
+      dateStr = Utilities.formatDate(row[2], Session.getScriptTimeZone(), "yyyy-MM-dd");
+    }
+
+    result.push({
+      id: String(row[0]),
+      name: row[1],
+      date: dateStr,
+      period: row[3],
+      location: row[4],
+      quota: Number(row[5]),
+      current: counts[row[0]] || 0,
+      isRegistered: userRegisteredActs.has(String(row[0])),
+      status: status 
+    });
+  });
+
+  if (mode === 'user') {
+    return result.filter(a => new Date(a.date) >= today).sort((a, b) => new Date(a.date) - new Date(b.date));
+  }
+  return result.sort((a, b) => new Date(b.date) - new Date(a.date));
+}
+
+function deleteActivity(id, adminId, token) {
+  verifyAdminToken(adminId, token); 
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Activities');
+    if (!sheet) return { success: false, message: 'ไม่พบฐานข้อมูล' };
+    
+    const rows = sheet.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(id)) {
+        sheet.deleteRow(i + 1);
+        SpreadsheetApp.flush();
+        return { success: true };
+      }
+    }
+    return { success: false, message: 'ไม่พบกิจกรรมที่ต้องการลบ' };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function registerStudentActivity(studentId, activityId, token) {
+  verifyUserToken(studentId, token); 
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const regSheet = ss.getSheetByName('ActivityRegistrations') || ss.insertSheet('ActivityRegistrations');
+  const actSheet = ss.getSheetByName('Activities');
+  const userSheet = ss.getSheetByName('Users');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000); 
+
+    const strStudentId = String(studentId).trim();
+    const strActivityId = String(activityId).trim();
+    const regs = regSheet.getDataRange().getValues();
+    const acts = actSheet.getDataRange().getValues();
+
+    for (let i = 1; i < regs.length; i++) {
+      if (String(regs[i][0]) === strActivityId && String(regs[i][1]) === strStudentId) {
+        return { success: false, message: 'คุณลงทะเบียนรอบนี้ไปแล้ว' };
+      }
+    }
+
+    let quota = 0;
+    let actFound = false;
+    let actDate = '-';   
+    let actPeriod = '-'; 
+
+    for (let i = 1; i < acts.length; i++) {
+      if (String(acts[i][0]) === strActivityId) {
+        quota = Number(acts[i][5]); 
+        const rawDate = acts[i][2]; 
+        if (rawDate instanceof Date) {
+            actDate = Utilities.formatDate(rawDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+        } else {
+            actDate = String(rawDate);
+        }
+        actPeriod = acts[i][3]; 
+        actFound = true;
+        break;
+      }
+    }
+    
+    if (!actFound) return { success: false, message: 'ไม่พบกิจกรรมนี้ในระบบ' };
+
+    let currentCount = 0;
+    for (let i = 1; i < regs.length; i++) {
+      if (String(regs[i][0]) === strActivityId) {
+        currentCount++;
+      }
+    }
+
+    if (currentCount >= quota) {
+      return { success: false, message: 'เสียใจด้วย การลงทะเบียนเต็มแล้ว' };
+    }
+
+    const users = userSheet.getDataRange().getValues();
+    let studentName = '-';
+    let faculty = '-';
+    for (let i = 1; i < users.length; i++) {
+       const row = users[i];
+       if (String(row[5]).trim() === strStudentId) {
+           studentName = `${row[4] || ''}${row[5]} ${row[6]}`.trim(); 
+           faculty = row[7] || '-';
+           break;
+       }
+    }
+
+    regSheet.appendRow([
+        strActivityId, 
+        strStudentId, 
+        studentName, 
+        faculty, 
+        actDate,    
+        actPeriod,  
+        new Date().toISOString()  
+    ]);
+    
+    SpreadsheetApp.flush(); 
+    return { success: true };
+
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function createQueueSlot(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ws = ss.getSheetByName("QueueSlots") || ss.insertSheet('QueueSlots'); 
+  const id = Utilities.getUuid();
+
+  ws.appendRow([id, data.date, data.time, data.quota, 0, data.status || 'Show']); 
+  return { success: true };
+}
+
+function toggleQueueStatus(id, newStatus, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ws = ss.getSheetByName("QueueSlots");
+    if (!ws) return { success: false, message: "ไม่พบฐานข้อมูล QueueSlots" };
+    
+    const rows = ws.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]).trim() === String(id).trim()) {
+        ws.getRange(i + 1, 6).setValue(newStatus);
+        SpreadsheetApp.flush();
+        return { success: true, newStatus: newStatus };
+      }
+    }
+    return { success: false, message: "ไม่พบข้อมูล ID นี้" };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteQueueSlot(id, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ws = ss.getSheetByName("QueueSlots");
+    const rows = ws.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(id)) {
+        ws.deleteRow(i + 1);
+        SpreadsheetApp.flush();
+        return { success: true };
+      }
+    }
+    return { success: false, message: 'ไม่พบข้อมูลที่ต้องการลบ' };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getQueueSlots(role, studentId, token) {
+  if (role === 'admin') {
+      verifyAdminToken(studentId, token); 
+  } else if (role === 'user') {
+      verifyUserToken(studentId, token);
+  } else {
+      throw new Error("403 Forbidden: ปฏิเสธการเข้าถึง (Invalid Role)");
+  }
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ws = ss.getSheetByName("QueueSlots");
+  if (!ws) return [];
+  const data = ws.getDataRange().getValues();
+  if (data.length <= 1) return [];
+  data.shift();
+  
+  const result = data.map(r => ({
+    id: r[0],
+    date: Utilities.formatDate(new Date(r[1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
+    time: r[2],
+    quota: r[3],
+    current: r[4],
+    status: r[5] || 'Show' 
+  }));
+
+  if(role === 'user') {
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    return result.filter(r => r.status === 'Show' && new Date(r.date) >= today);
+  }
+  return result.sort((a,b) => new Date(a.date) - new Date(b.date)); 
+}
+
+function getQueueAttendees(searchDate, searchTime, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const slotSheet = ss.getSheetByName("QueueSlots");
+  if (!slotSheet) return [];
+  const slotRows = slotSheet.getDataRange().getValues();
+  let targetSlotId = null;
+  const cleanSearchDate = String(searchDate).trim();
+  const cleanSearchTime = String(searchTime).trim();
+
+  for (let i = 1; i < slotRows.length; i++) {
+    const rawDate = slotRows[i][1];
+    const rawTime = slotRows[i][2];
+    if (!rawDate || !rawTime) continue;
+    const rowDateStr = Utilities.formatDate(new Date(rawDate), Session.getScriptTimeZone(), "yyyy-MM-dd");
+    if (rowDateStr === cleanSearchDate && String(rawTime).trim() === cleanSearchTime) {
+      targetSlotId = slotRows[i][0];
+      break; 
+    }
+  }
+  if (!targetSlotId) return [];
+
+  const userSheet = ss.getSheetByName("Users");
+  const userRows = userSheet.getDataRange().getValues();
+  const facultyMap = {};
+  for (let i = 1; i < userRows.length; i++) {
+    const uId = String(userRows[i][5]).trim(); 
+    if (uId) facultyMap[uId] = userRows[i][6];
+  }
+
+  const bookSheet = ss.getSheetByName("QueueBookings"); 
+  if (!bookSheet) return [];
+  const bookRows = bookSheet.getDataRange().getValues();
+  const result = [];
+  
+  for (let i = 1; i < bookRows.length; i++) {
+    if (String(bookRows[i][1]).trim() === String(targetSlotId).trim()) {
+      const stuId = String(bookRows[i][2]).trim(); 
+      result.push({
+        studentId: stuId,
+        name: bookRows[i][3] || "ไม่ระบุชื่อ", 
+        queueNumber: String(bookRows[i][4]),   
+        faculty: facultyMap[stuId] || "-"
+      });
+    }
+  }
+  return result.sort((a, b) => String(a.queueNumber).localeCompare(String(b.queueNumber)));
+}
+
+function getQueueSlotOptions(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ws = ss.getSheetByName("QueueSlots");
+  if(!ws) return {};
+  const data = ws.getDataRange().getValues();
+  if(data.length <= 1) return {};
+  data.shift(); 
+  
+  const optionsMap = {};
+  data.forEach(row => {
+    if (row[1]) {
+      let dateKey = Utilities.formatDate(new Date(row[1]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+      let timeVal = String(row[2]);
+      if (!optionsMap[dateKey]) optionsMap[dateKey] = [];
+      if (optionsMap[dateKey].indexOf(timeVal) === -1) optionsMap[dateKey].push(timeVal);
+    }
+  });
+  return optionsMap;
+}
+
+function getOverallQueueData(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const slotSheet = ss.getSheetByName("QueueSlots");
+  const bookSheet = ss.getSheetByName("QueueBookings");
+  const userSheet = ss.getSheetByName("Users");
+  
+  if (!slotSheet || !bookSheet || !userSheet) return { list: [], stats: { totalQuota:0, totalBooked:0, avail:0 } };
+  
+  const slots = slotSheet.getDataRange().getValues().slice(1);
+  const books = bookSheet.getDataRange().getValues().slice(1);
+  const users = userSheet.getDataRange().getValues().slice(1);
+  
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  
+  let totalQuota = 0;
+  let totalBooked = 0;
+  
+  slots.forEach(s => {
+     const rawDate = s[1];
+     if (!rawDate) return;
+     const sDate = new Date(rawDate);
+     sDate.setHours(0,0,0,0);
+     if (sDate >= today && s[5] !== 'Hide') {
+         totalQuota += Number(s[3]) || 0;
+         totalBooked += Number(s[4]) || 0;
+     }
+  });
+  
+  const facultyMap = {};
+  users.forEach(u => {
+     if (u[5]) facultyMap[String(u[5]).trim()] = u[6];
+  });
+  
+  const list = [];
+  books.forEach(b => {
+     const rawDate = b[6];
+     if (!rawDate) return;
+     const bDate = new Date(rawDate);
+     bDate.setHours(0,0,0,0);
+     
+     if(bDate >= today) {
+         const stuId = String(b[2]).trim();
+         list.push({
+             queueNumber: String(b[4]),
+             studentId: stuId,
+             name: String(b[3]) || "ไม่ระบุชื่อ",
+             faculty: facultyMap[stuId] || "-",
+             date: Utilities.formatDate(bDate, Session.getScriptTimeZone(), "yyyy-MM-dd"),
+             time: String(b[7]).trim()
+         });
+     }
+  });
+  
+  list.sort((a,b) => {
+     if(a.date !== b.date) return String(a.date).localeCompare(String(b.date));
+     if(a.time !== b.time) return String(a.time).localeCompare(String(b.time));
+     return String(a.queueNumber).localeCompare(String(b.queueNumber));
+  });
+  
+  return {
+     list: list,
+     stats: {
+        totalQuota: totalQuota,
+        totalBooked: totalBooked,
+        avail: Math.max(0, totalQuota - totalBooked)
+     }
+  };
+}
+
+function bookQueue(studentId, slotId, token) {
+  verifyUserToken(studentId, token);
+  var lock = LockService.getScriptLock();
+  
+  try {
+    lock.waitLock(10000); 
+  } catch (e) {
+    return { success: false, message: 'มีผู้ใช้งานระบบจำนวนมากระบบประมวลผลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง' };
+  }
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var slotSheet = ss.getSheetByName('QueueSlots');
+    var bookSheet = ss.getSheetByName('QueueBookings');
+    var userSheet = ss.getSheetByName('Users');
+
+    if (!slotSheet || !bookSheet || !userSheet) {
+      return { success: false, message: 'System Error: ไม่พบฐานข้อมูล' };
+    }
+
+    var strStudentId = String(studentId).trim();
+    var strSlotId = String(slotId).trim();
+    var today = new Date(); today.setHours(0,0,0,0);
+    
+    var books = bookSheet.getDataRange().getValues();
+    for(var i=1; i<books.length; i++) {
+       if(String(books[i][2]).trim() === strStudentId) {
+          var bookedDate = new Date(books[i][5]);
+          if(bookedDate >= today) {
+             return { success: false, message: 'ท่านมีคิวที่จองไว้อยู่แล้ว ไม่สามารถจองเพิ่มได้' };
+          }
+       }
+    }
+
+    var slots = slotSheet.getDataRange().getValues();
+    var slotRowIndex = -1;
+    var slotData = null;
+    
+    for(var i=0; i<slots.length; i++) {
+      if(String(slots[i][0]).trim() === strSlotId) {
+        slotRowIndex = i + 1; 
+        slotData = slots[i]; 
+        break;
+      }
+    }
+
+    if(slotRowIndex === -1) return { success: false, message: 'ไม่พบข้อมูลรอบเวลา' };
+    
+    var quota = Number(slotData[3]);
+    var current = Number(slotData[4]);
+
+    if(current >= quota) {
+        return { success: false, message: 'เสียใจด้วย รอบนี้เต็มแล้ว' };
+    }
+
+    var studentName = 'ไม่ระบุชื่อ';
+    var users = userSheet.getDataRange().getValues();
+    for(var i=1; i<users.length; i++) {
+       if(String(users[i][5]).trim() === strStudentId) {
+          studentName = String(users[i][2]) + String(users[i][3]) + ' ' + String(users[i][4]); 
+          break;
+       }
+    }
+
+    var randomCode = Utilities.getUuid().replace(/-/g, '').substring(0, 6).toUpperCase();
+    slotSheet.getRange(slotRowIndex, 5).setValue(current + 1);
+  
+    bookSheet.appendRow([
+      Utilities.getUuid(), 
+      strSlotId,            
+      strStudentId,         
+      studentName,          
+      randomCode,           
+      slotData[1],          
+      slotData[2],          
+      new Date().toISOString()            
+    ]);
+    
+    SpreadsheetApp.flush(); 
+    recordSystemLog(strStudentId, studentName, "จองคิวสำเร็จ (รหัสคิว: " + randomCode + ")", "Web App");
+
+    return { success: true, queueNumber: randomCode };
+
+  } catch(e) {
+    return { success: false, message: 'ระบบจองคิวขัดข้อง กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getMyQueue(studentId, token) {
+  verifyUserToken(studentId, token); 
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const bookSheet = ss.getSheetByName('QueueBookings');
+  if(!bookSheet) return null;
+  
+  const books = bookSheet.getDataRange().getValues().slice(1);
+  
+  const today = new Date(); 
+  today.setHours(0,0,0,0);
+  
+  const cutoffDate = new Date(today);
+  cutoffDate.setDate(today.getDate() - 7); 
+
+  const myQueues = books.filter(r => {
+    const rowStudentId = String(r[2]).trim();
+    const rowDate = new Date(r[5]); 
+    rowDate.setHours(0,0,0,0);
+    
+    return rowStudentId === String(studentId).trim() && rowDate >= cutoffDate;
+  });
+
+  if(myQueues.length === 0) return null;
+  
+  const latest = myQueues[myQueues.length - 1];
+  
+  const appointDate = new Date(latest[5]);
+  appointDate.setHours(0,0,0,0);
+  const isExpired = appointDate < today; 
+
+  return { 
+    queueNumber: String(latest[4]), 
+    date: Utilities.formatDate(new Date(latest[5]), Session.getScriptTimeZone(), "yyyy-MM-dd"), 
+    time: String(latest[6]), 
+    name: String(latest[3]),
+    isExpired: isExpired 
+  };
+}
+
+function cancelQueue(studentId, token) {
+  verifyUserToken(studentId, token); 
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000); 
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var bookingSheetName = "QueueBookings"; 
+    var roundSheetName = "QueueSlots";    
+    var bookSheet = ss.getSheetByName(bookingSheetName);
+    var roundSheet = ss.getSheetByName(roundSheetName);
+
+    if (!bookSheet) return { success: false, message: "ไม่พบฐานข้อมูล: " + bookingSheetName };
+    if (!roundSheet) return { success: false, message: "ไม่พบฐานข้อมูล: " + roundSheetName };
+
+    var data = bookSheet.getDataRange().getValues();
+    var rowIndexToDelete = -1;
+    var roundIdToRestore = null;
+
+    for (var i = 1; i < data.length; i++) {
+      var bookedDate = new Date(data[i][5]); 
+      var today = new Date(); today.setHours(0,0,0,0);
+      
+      if (String(data[i][2]).trim() === String(studentId).trim() && bookedDate >= today) { 
+        rowIndexToDelete = i + 1;     
+        roundIdToRestore = data[i][1]; 
+        break;
+      }
+    }
+
+    if (rowIndexToDelete === -1) {
+      return { success: false, message: "ไม่พบข้อมูลการจองล่าสุดของคุณในระบบ หากมีข้อผิดพลาดกรุณาติดต่อสถานศึกษา" };
+    }
+
+    bookSheet.deleteRow(rowIndexToDelete);
+
+    if (roundIdToRestore) {
+      var roundData = roundSheet.getDataRange().getValues();
+      for (var j = 1; j < roundData.length; j++) {
+        if (String(roundData[j][0]).trim() === String(roundIdToRestore).trim()) {
+           var currentQuotaColIndex = 4; 
+           var currentVal = parseInt(roundData[j][currentQuotaColIndex]);
+           if (isNaN(currentVal)) currentVal = 0;
+           var newVal = (currentVal > 0) ? currentVal - 1 : 0;
+           roundSheet.getRange(j + 1, currentQuotaColIndex + 1).setValue(newVal);
+           break; 
+        }
+      }
+    }
+    return { success: true };
+
+  } catch (e) {
+    return { success: false, message: "ระบบยกเลิกคิวขัดข้อง ไม่สามารถดำเนินการได้ในขณะนี้" };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function uploadAndImportExcel(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock(); 
+  let tempFileId = null; 
+  
+  const blockedPrefixes = data.blockedPrefixes || []; 
+
+  try {
+    lock.waitLock(15000);
+    if (!data.content || typeof data.content !== 'string') return { success: false, message: 'รูปแบบข้อมูลไฟล์ไม่ถูกต้อง' };
+    if (data.content.length > 7000000) return { success: false, message: 'ระบบความปลอดภัย: ไฟล์มีขนาดใหญ่เกินกว่าที่กำหนด' };
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.content), data.mimeType, data.fileName);
+    const resource = { title: '[TEMP] Uploaded File', mimeType: MimeType.GOOGLE_SHEETS };
+    const tempFile = Drive.Files.create(resource, blob);
+    tempFileId = tempFile.id; 
+    
+    const tempSS = SpreadsheetApp.openById(tempFileId);
+    const tempSheet = tempSS.getSheets()[0]; 
+    const allValues = tempSheet.getDataRange().getValues();
+
+    if (allValues.length < 5) return { success: false, message: 'ไฟล์ข้อมูลน้อยเกินไป หรือไม่มีข้อมูลในแถวที่ 5' };
+    
+    const dataRows = allValues.slice(4); 
+    const validRows = dataRows.filter(row => row[0] != "" && row[1] != "");
+
+    if (validRows.length === 0) return { success: false, message: 'ไม่พบข้อมูลในแถวที่ 5 ลงไป' };
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    let targetSheet = ss.getSheetByName(SHEET_LOAN_ELIGIBLE);
+    
+    if (!targetSheet) {
+      targetSheet = ss.insertSheet(SHEET_LOAN_ELIGIBLE);
+      targetSheet.appendRow(['studentId', 'name', 'idCard', 'year', 'status', 'termDate', 'note', 'acYear', 'level', 'faculty', 'currCode', 'curriculum', 'gpa', 'credits', 'updatedAt']);
+    }
+
+    const existingIds = new Set();
+    const existingData = targetSheet.getDataRange().getValues();
+    for (let i = 1; i < existingData.length; i++) {
+        existingIds.add(String(existingData[i][0]).trim());
+    }
+
+    const timestamp = new Date().toISOString();
+    const finalData = [];
+    
+    let duplicateCount = 0;
+    let blockedCount = 0;
+
+    validRows.forEach(r => {
+      const stdId = secureInput(String(r[0]).trim()); 
+      const prefix = stdId.substring(0, 2);
+
+      if (blockedPrefixes.includes(prefix)) {
+          blockedCount++;
+      } else if (existingIds.has(stdId)) {
+          duplicateCount++;
+      } else {
+          finalData.push([
+            stdId, 
+            secureInput(String(r[1])), 
+            secureInput(String(r[2])), 
+            secureInput(String(r[3])), 
+            secureInput(String(r[4])), 
+            secureInput(String(r[5])), 
+            secureInput(String(r[6])), 
+            secureInput(String(r[7])), 
+            secureInput(String(r[8])), 
+            secureInput(String(r[9])), 
+            secureInput(String(r[10])), 
+            secureInput(String(r[11])), 
+            secureInput(String(r[12])), 
+            secureInput(String(r[13])), 
+            timestamp 
+          ]);
+          existingIds.add(stdId);
+      }
+    });
+
+    if (finalData.length > 0) {
+      const lastRow = targetSheet.getLastRow();
+      targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
+      
+      let msg = `นำเข้าสำเร็จ ${finalData.length} รายการ`;
+      if (duplicateCount > 0) msg += ` (ซ้ำ ${duplicateCount} รายการ)`;
+      if (blockedCount > 0) msg += ` (ข้ามรหัสชั้นปีที่ระบุ ${blockedCount} รายการ)`;
+
+      return { success: true, count: finalData.length, message: msg };
+    } else {
+      let errorMsg = 'ไม่พบข้อมูลใหม่ (มีอยู่ในระบบแล้วทั้งหมด)';
+      if (blockedCount > 0) errorMsg = `ไม่มีการบันทึกข้อมูลใหม่ (ติดเงื่อนไขรหัสชั้นปี ${blockedCount} รายการ)`;
+      return { success: false, message: errorMsg };
+    }
+ } catch (e) {
+    return { success: false, message: 'Error: ' + e.message };
+  } finally {
+    if (tempFileId) { try { Drive.Files.remove(tempFileId); } catch (err) {} }
+    lock.releaseLock();
+  }
+}
+
+function uploadAndImportGPACredits(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  let tempFileId = null;
+  try {
+    lock.waitLock(15000);
+    if (!data.content || typeof data.content !== 'string') return { success: false, message: 'รูปแบบข้อมูลไฟล์ไม่ถูกต้อง' };
+    if (data.content.length > 7000000) return { success: false, message: 'ระบบความปลอดภัย: ไฟล์มีขนาดใหญ่เกินกว่าที่กำหนด (จำกัด 5MB)' };
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.content), data.mimeType, data.fileName);
+    const resource = { title: '[TEMP] GPA Upload', mimeType: MimeType.GOOGLE_SHEETS };
+    const tempFile = Drive.Files.create(resource, blob);
+    tempFileId = tempFile.id;
+    
+    const tempSS = SpreadsheetApp.openById(tempFileId);
+    const tempSheet = tempSS.getSheets()[0];
+    const allValues = tempSheet.getDataRange().getValues();
+
+    if (allValues.length < 4) return { success: false, message: 'ไฟล์ข้อมูลน้อยเกินไป หรือไม่มีข้อมูล' };
+
+    const updateMap = {};
+    
+    for (let i = 3; i < allValues.length; i++) {
+        const row = allValues[i];
+        const seqValue = String(row[0]).trim();
+        if (!seqValue || isNaN(seqValue)) {
+            continue; 
+        }
+
+        const stdId = secureInput(String(row[4]).trim()); 
+        if (stdId) {
+            let rawGpa = String(row[7]);
+            let rawCredits = String(row[8]);
+
+            rawGpa = rawGpa.replace(/[\r\n\t\s]+/g, '');
+            rawCredits = rawCredits.replace(/[\r\n\t\s]+/g, '');
+
+            let matchGpa = rawGpa.match(/[0-9]+(\.[0-9]+)?/);
+            let matchCredits = rawCredits.match(/[0-9]+(\.[0-9]+)?/);
+
+            let cleanGpa = matchGpa ? matchGpa[0] : "0.00";
+            let cleanCredits = matchCredits ? matchCredits[0] : "0";
+
+            updateMap[stdId] = { 
+                gpa: secureInput(cleanGpa), 
+                credits: secureInput(cleanCredits) 
+            };
+        }
+    }
+
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const targetSheet = ss.getSheetByName('Eligible_2569');
+    if (!targetSheet) return { success: false, message: 'ไม่พบฐานข้อมูล Eligible_2569' };
+
+    const targetData = targetSheet.getDataRange().getValues();
+    let updateCount = 0;
+    const uniqueSubmitted = Object.keys(updateMap).length; 
+
+    for (let i = 1; i < targetData.length; i++) {
+        const targetStdId = String(targetData[i][0]).trim();
+        if (updateMap[targetStdId]) {
+            targetData[i][12] = updateMap[targetStdId].gpa;
+            targetData[i][13] = updateMap[targetStdId].credits;
+            updateCount++;
+        }
+    }
+
+    const failedCount = uniqueSubmitted - updateCount;
+    if (updateCount > 0) {
+        targetSheet.getRange(1, 1, targetData.length, targetData[0].length).setValues(targetData);
+    }
+    return { success: true, updateCount: updateCount, failedCount: failedCount };
+  } catch (e) {
+    return { success: false, message: 'Error: ' + e.message };
+  } finally {
+    if (tempFileId) { try { Drive.Files.remove(tempFileId); } catch (err) {} }
+    lock.releaseLock();
+  }
+}
+
+function getLoanDashboardStats2569(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+  const eligibleSheet = ss.getSheetByName(SHEET_LOAN_ELIGIBLE);
+  const requestSheet = ss.getSheetByName(SHEET_LOAN_REQUESTS);
+
+  const eligibles = eligibleSheet ? eligibleSheet.getDataRange().getValues().slice(1) : [];
+  const requests = requestSheet ? requestSheet.getDataRange().getValues().slice(1) : [];
+
+  let stats = {
+    totalEligible: eligibles.length,
+    submitted: 0,
+    notSubmitted: 0,
+    gpaFail: 0,
+    creditFail: 0
+  };
+
+  const submittedIds = new Set(requests.map(r => String(r[1])));
+
+  eligibles.forEach(row => {
+    const stdId = String(row[0]);
+    const gpa = parseFloat(row[12]);
+    const credit = parseFloat(row[13]);
+
+    if (submittedIds.has(stdId)) {
+      stats.submitted++;
+    } else {
+      stats.notSubmitted++;
+    }
+
+    if (gpa < 1.50) stats.gpaFail++;
+    if (credit < 12) stats.creditFail++;
+  });
+
+  return { success: true, ...stats };
+}
+
+function adminGetLoanInfo(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+  const eligibleSheet = ss.getSheetByName('Eligible_2569');
+  const requestSheet = ss.getSheetByName('LoanRequests_2569');
+  
+  const targetId = String(studentId).trim();
+  
+  const eligibles = eligibleSheet ? eligibleSheet.getDataRange().getDisplayValues() : [];
+  let studentInfo = null;
+  
+  for(let i=1; i<eligibles.length; i++) {
+    if(String(eligibles[i][0]).trim() === targetId) {
+      const gpa = parseFloat(eligibles[i][12]) || 0;
+      const credits = parseFloat(eligibles[i][13]) || 0;
+      
+      const isPassed = (gpa >= 1.50 && credits >= 12); 
+
+      studentInfo = {
+        studentId: String(eligibles[i][0]),
+        name: String(eligibles[i][1]),
+        faculty: String(eligibles[i][9]),
+        gpa: String(eligibles[i][12]),     
+        credits: String(eligibles[i][13]), 
+        isPassed: isPassed         
+      };
+      break;
+    }
+  }
+  
+  if(!studentInfo) {
+    return { status: 'not_found_student' };
+  }
+  
+  let loanData = null;
+  if(requestSheet) {
+    const requests = requestSheet.getDataRange().getValues();
+    for(let i=1; i<requests.length; i++) {
+      if(String(requests[i][1]).trim() === targetId) {
+        loanData = {
+          requestId: String(requests[i][0]),
+          livingAmount: requests[i][4],
+          tuitionAmount: requests[i][5],
+          status: String(requests[i][7])
+        };
+        break;
+      }
+    }
+  }
+  
+  return {
+    status: 'found',
+    studentInfo: studentInfo,
+    loanData: loanData
+  };
+}
+
+function adminSaveLoanRequest(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    let sheet = ss.getSheetByName('LoanRequests_2569');
+    if(!sheet) return { success: false, message: 'ไม่พบฐานข้อมูล' };
+    
+    const targetId = String(data.studentId).trim();
+    const rows = sheet.getDataRange().getValues();
+    let rowIndex = -1;
+    
+    for(let i=1; i<rows.length; i++) {
+      if(String(rows[i][1]).trim() === targetId) {
+        rowIndex = i + 1; 
+        break;
+      }
+    }
+    
+    const submittedAt = new Date().toISOString();
+    
+    if(rowIndex > 0) {
+      sheet.getRange(rowIndex, 4).setValue(secureInput(data.reqType));
+      sheet.getRange(rowIndex, 5).setValue(secureInput(data.livingAmount));
+      sheet.getRange(rowIndex, 6).setValue(secureInput(data.tuitionAmount));
+      sheet.getRange(rowIndex, 7).setValue(secureInput(data.totalAmount));
+      sheet.getRange(rowIndex, 9).setValue(submittedAt);
+    } else {
+      const id = Utilities.getUuid();
+      sheet.appendRow([
+        id,
+        targetId,
+        secureInput(data.name),
+        secureInput(data.reqType),
+        secureInput(data.livingAmount),
+        secureInput(data.tuitionAmount),
+        secureInput(data.totalAmount),
+        'Pending', 
+        submittedAt
+      ]);
+    }
+    
+    SpreadsheetApp.flush();
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function adminDeleteLoanRequest(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock(); 
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const sheet = ss.getSheetByName('LoanRequests_2569');
+    if(!sheet) return { success: false, message: 'ไม่พบฐานข้อมูล' };
+    
+    const targetId = String(studentId).trim();
+    const rows = sheet.getDataRange().getValues();
+    
+    for(let i=1; i<rows.length; i++) {
+      if(String(rows[i][1]).trim() === targetId) {
+        sheet.deleteRow(i + 1);
+        SpreadsheetApp.flush(); 
+        return { success: true };
+      }
+    }
+    
+    return { success: false, message: 'ไม่พบข้อมูลที่ต้องการลบ' };
+  } catch(e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getAdminReportCSV(reportType, selectedFaculty, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+  const eligibleSheet = ss.getSheetByName('Eligible_2569');
+  const requestSheet = ss.getSheetByName('LoanRequests_2569');
+  
+  if (!eligibleSheet) return { success: false, message: 'ไม่พบฐานข้อมูลผู้มีสิทธิ์ (Eligible_2569)' };
+
+  const eligibles = eligibleSheet.getDataRange().getDisplayValues(); 
+  const requests = requestSheet ? requestSheet.getDataRange().getDisplayValues() : [];
+
+  const studentMap = {};
+  for(let i=1; i<eligibles.length; i++) {
+    const stdId = String(eligibles[i][0]).trim().replace(/,/g, ""); 
+    if(!stdId) continue;
+    studentMap[stdId] = {
+      name: String(eligibles[i][1]).trim(),
+      faculty: String(eligibles[i][9]).trim(), 
+      gpa: parseFloat(eligibles[i][12]) || 0,
+      credits: parseFloat(eligibles[i][13]) || 0
+    };
+  }
+
+  const submittedIds = new Set();
+  for(let i=1; i<requests.length; i++) {
+    const rawId = String(requests[i][1]).trim().replace(/,/g, "");
+    if(rawId) submittedIds.add(rawId);
+  }
+
+  let csvContent = "";
+  let count = 0;
+  
+  if (reportType === 'submitted') {
+    csvContent = "ลำดับ,รหัสนักศึกษา,ชื่อ-สกุล,คณะ,ประเภทกู้,ค่าครองชีพ,ค่าเทอม,ยอดรวม,วันที่ยื่น\n";
+    
+    for(let i=1; i<requests.length; i++) {
+      const r = requests[i];
+      const stdId = String(r[1]).trim().replace(/,/g, ""); 
+      if(!stdId) continue;
+      
+      const stdInfo = studentMap[stdId] || { faculty: 'ไม่ระบุข้อมูล' }; 
+      // กรองคณะ
+      if (selectedFaculty !== 'all' && stdInfo.faculty !== selectedFaculty) continue;
+
+      count++;
+      const safeName = String(r[2]).replace(/,/g, " ").trim();
+      const safeFaculty = String(stdInfo.faculty).replace(/,/g, " ");
+      
+      csvContent += `${count},"${stdId}","${safeName}","${safeFaculty}","${r[3]}","${r[4]}","${r[5]}","${r[6]}","${r[8]}"\n`;
+    }
+  } 
+  else if (reportType === 'ineligible') {
+    csvContent = "ลำดับ,รหัสนักศึกษา,ชื่อ-สกุล,คณะ,GPA,หน่วยกิต,สาเหตุที่ไม่ผ่าน\n";
+    
+    for(let i=1; i<eligibles.length; i++) {
+      const stdId = String(eligibles[i][0]).trim().replace(/,/g, ""); 
+      if(!stdId) continue;
+      
+      const info = studentMap[stdId];
+      if (selectedFaculty !== 'all' && info.faculty !== selectedFaculty) continue;
+
+      const isLowGpa = info.gpa < 1.50; 
+      const isLowCredit = info.credits < 12;
+
+      if (isLowGpa || isLowCredit) {
+        count++;
+        let reason = [];
+        if(isLowGpa) reason.push(`เกรดเฉลี่ยต่ำ (${info.gpa})`);
+        if(isLowCredit) reason.push(`หน่วยกิตไม่ถึง (${info.credits})`);
+        
+        csvContent += `${count},"${stdId}","${String(info.name).replace(/,/g, " ")}","${String(info.faculty).replace(/,/g, " ")}","${info.gpa}","${info.credits}","${reason.join(" และ ")}"\n`;
+      }
+    }
+  }
+  else if (reportType === 'not_submitted') {
+    csvContent = "ลำดับ,รหัสนักศึกษา,ชื่อ-สกุล,คณะ,GPA,หน่วยกิต,สถานะ\n";
+    
+    for(let i=1; i<eligibles.length; i++) {
+      const stdId = String(eligibles[i][0]).trim().replace(/,/g, "");
+      if(!stdId) continue;
+      
+      const info = studentMap[stdId];
+      if (selectedFaculty !== 'all' && info.faculty !== selectedFaculty) continue;
+
+      const isPassed = (info.gpa >= 1.50 && info.credits >= 12); 
+      
+      if (isPassed && !submittedIds.has(stdId)) {
+        count++;
+        csvContent += `${count},"${stdId}","${String(info.name).replace(/,/g, " ")}","${String(info.faculty).replace(/,/g, " ")}","${info.gpa}","${info.credits}",ยังไม่ดำเนินการ\n`;
+      }
+    }
+  }
+
+  if (count === 0) {
+    return { success: false, message: 'ไม่พบรายชื่อนักศึกษาที่ตรงกับเงื่อนไข หรือยังไม่มีผู้ทำรายการในหมวดนี้' };
+  }
+
+  return { success: true, csvData: csvContent };
+}
+
+function checkStudentEligibility2569(studentId, token) {
+  verifyUserToken(studentId, token);
+  try {
+    const targetId = String(studentId).trim();
+    
+    const cache = CacheService.getScriptCache();
+    const cachedResult = cache.get('elig_2569_' + targetId);
+    if (cachedResult) {
+       return JSON.parse(cachedResult); 
+    }
+ 
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const eligibleSheet = ss.getSheetByName('Eligible_2569');
+    const requestSheet = ss.getSheetByName('LoanRequests_2569');
+
+    if (requestSheet && requestSheet.getLastRow() > 1) {
+      const requests = requestSheet.getDataRange().getDisplayValues();
+      for (let i = 1; i < requests.length; i++) {
+        if (String(requests[i][1]).trim() === targetId) {
+          const res = { 
+            status: 'submitted', 
+            data: {
+              reqType: String(requests[i][3]),
+              livingAmount: requests[i][4],
+              tuitionAmount: requests[i][5],
+              totalAmount: requests[i][6]
+            }
+          };
+          cache.put('elig_2569_' + targetId, JSON.stringify(res), 300); // จำไว้ 5 นาที
+          return res;
+        }
+      }
+    }
+
+    if (!eligibleSheet) return { status: 'not_found', message: 'ไม่พบฐานข้อมูลผู้มีสิทธิ์กู้' };
+    const eligibles = eligibleSheet.getDataRange().getDisplayValues();
+    let studentData = null;
+    for (let i = 1; i < eligibles.length; i++) {
+      if (String(eligibles[i][0]).trim() === targetId) {
+        studentData = eligibles[i];
+        break;
+      }
+    }
+
+    if (!studentData) return { status: 'not_found', message: 'ไม่พบรายชื่อของท่านในกลุ่มผู้มีสิทธิ์กู้' };
+    const profiles = getData_(SHEET_NAMES.PROFILES);
+    const hasProfile = profiles.find(p => String(p.studentId).trim() === targetId);
+    
+    if (!hasProfile) {
+      return { status: 'no_profile', message: 'ไม่พบข้อมูลประวัติในระบบ' };
+    }
+
+    const gpa = parseFloat(studentData[12]) || 0;
+    const credits = parseFloat(studentData[13]) || 0;
+    const isPassed = (gpa >= 1.50 && credits >= 12);
+    
+    const finalResult = {
+      status: 'eligible_check',
+      passed: isPassed,
+      studentInfo: { 
+        studentId: String(studentData[0]), 
+        name: String(studentData[1]), 
+        faculty: String(studentData[9]), 
+        curriculum: String(studentData[11]), 
+        gpa: gpa, 
+        credits: credits,
+        updatedAt: studentData[14] 
+      }
+    };
+
+    cache.put('elig_2569_' + targetId, JSON.stringify(finalResult), 300); 
+    return finalResult;
+
+  } catch (e) {
+    return { success: false, message: 'ระบบตรวจสอบสิทธิ์ขัดข้อง ไม่สามารถดำเนินการได้ในขณะนี้' };
+  }
+}
+
+function submitLoanRequest2569(data) {
+  verifyUserToken(data.studentId, data.token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    let sheet = ss.getSheetByName('LoanRequests_2569');
+    
+    if (!sheet) {
+      sheet = ss.insertSheet('LoanRequests_2569');
+      sheet.appendRow(['requestId', 'studentId', 'name', 'reqType', 'livingAmount', 'tuitionAmount', 'totalAmount', 'status', 'submittedAt']);
+    }
+
+    const targetId = String(data.studentId).trim();
+
+    const existing = sheet.getDataRange().getValues().find(r => String(r[1]).trim() === targetId);
+    if (existing) return { success: false, message: 'ท่านได้ยื่นคำร้องไปแล้ว' };
+
+    const id = Utilities.getUuid(); 
+    const submittedAt = new Date().toISOString();
+    
+    sheet.appendRow([
+      id,
+      targetId, 
+      secureInput(data.name),
+      secureInput(data.reqType),
+      secureInput(data.livingAmount),
+      secureInput(data.tuitionAmount),
+      secureInput(data.totalAmount),
+      'Pending',
+      submittedAt
+    ]);
+
+    SpreadsheetApp.flush();
+    recordSystemLog(data.studentId, data.name, "ยื่นคำร้องกู้ยืม 2569 (ยอดรวม: " + data.totalAmount + ")", "Web App");
+
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: 'ระบบยื่นกู้ยืมขัดข้อง ไม่สามารถดำเนินการได้ในขณะนี้' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function uploadAndImportOverExcel(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  let tempFileId = null;
+  
+  const blockedPrefixes = data.blockedPrefixes || []; 
+
+  try {
+    lock.waitLock(15000);
+    if (!data.content || typeof data.content !== 'string') return { success: false, message: 'รูปแบบข้อมูลไฟล์ไม่ถูกต้อง' };
+    if (data.content.length > 7000000) return { success: false, message: 'ระบบความปลอดภัย: ไฟล์มีขนาดใหญ่เกินกว่าที่กำหนด' };
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.content), data.mimeType, data.fileName);
+    const resource = { title: '[TEMP] Over Upload', mimeType: MimeType.GOOGLE_SHEETS };
+    const tempFile = Drive.Files.create(resource, blob);
+    tempFileId = tempFile.id;
+    
+    const tempSS = SpreadsheetApp.openById(tempFileId);
+    const tempSheet = tempSS.getSheets()[0];
+    const allValues = tempSheet.getDataRange().getValues();
+
+    if (allValues.length < 5) return { success: false, message: 'ไฟล์ข้อมูลน้อยเกินไป หรือไม่มีข้อมูลในแถวที่ 5' };
+    
+    const dataRows = allValues.slice(4);
+    const validRows = dataRows.filter(row => row[0] != "" && row[1] != "");
+
+    if (validRows.length === 0) return { success: false, message: 'ไม่พบข้อมูลในแถวที่ 5 ลงไป' };
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    let targetSheet = ss.getSheetByName(SHEET_OVER_ELIGIBLE);
+    if (!targetSheet) { 
+        setupOverDatabase(); 
+        targetSheet = ss.getSheetByName(SHEET_OVER_ELIGIBLE); 
+    }
+
+    const existingIds = new Set();
+    const existingData = targetSheet.getDataRange().getValues();
+    for (let i = 1; i < existingData.length; i++) { existingIds.add(String(existingData[i][0]).trim()); }
+
+    const finalData = [];
+    const timestamp = new Date().toISOString();
+
+    let duplicateCount = 0;
+    let blockedCount = 0;
+
+    validRows.forEach(r => {
+      const stdId = secureInput(String(r[0]).trim()); 
+      const prefix = stdId.substring(0, 2);
+
+      if (blockedPrefixes.includes(prefix)) {
+          blockedCount++;
+      } else if (existingIds.has(stdId)) {
+          duplicateCount++;
+      } else {
+          let rawGpa = String(r[12]).replace(/[\r\n\t\s]+/g, '');
+          let matchGpa = rawGpa.match(/[0-9]+(\.[0-9]+)?/);
+          let cleanGpa = matchGpa ? matchGpa[0] : "0.00";
+
+          let rawCredits = String(r[13]).replace(/[\r\n\t\s]+/g, '');
+          let matchCredits = rawCredits.match(/[0-9]+(\.[0-9]+)?/);
+          let cleanCredits = matchCredits ? matchCredits[0] : "0";
+
+          finalData.push([
+            stdId, 
+            secureInput(String(r[1])), 
+            secureInput(String(r[2])), 
+            secureInput(String(r[3])), 
+            secureInput(String(r[4])), 
+            secureInput(String(r[5])), 
+            secureInput(String(r[6])), 
+            secureInput(String(r[7])), 
+            secureInput(String(r[8])), 
+            secureInput(String(r[9])), 
+            secureInput(String(r[10])), 
+            secureInput(String(r[11])), 
+            secureInput(cleanGpa),      
+            secureInput(cleanCredits),  
+            timestamp 
+          ]);
+          existingIds.add(stdId);
+      }
+    });
+
+    if (finalData.length > 0) {
+      const lastRow = targetSheet.getLastRow();
+      targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
+      
+      let msg = `นำเข้าสำเร็จ ${finalData.length} รายการ`;
+      if (duplicateCount > 0) msg += ` (ซ้ำ ${duplicateCount} รายการ)`;
+      if (blockedCount > 0) msg += ` (ข้ามรหัสชั้นปีที่ระบุ ${blockedCount} รายการ)`;
+
+      return { success: true, count: finalData.length, message: msg };
+    }
+    
+    let errorMsg = 'ไม่พบข้อมูลใหม่ (ข้อมูลทั้งหมดมีอยู่ในระบบแล้ว)';
+    if (blockedCount > 0) errorMsg = `ไม่มีการบันทึกข้อมูลใหม่ (ติดเงื่อนไขรหัสชั้นปี ${blockedCount} รายการ)`;
+    return { success: false, message: errorMsg };
+  } catch (e) {
+    return { success: false, message: 'Error: ' + e.message };
+  } finally {
+    if (tempFileId) { try { Drive.Files.remove(tempFileId); } catch (err) {} }
+    lock.releaseLock();
+  }
+}
+
+function getLoanProfilesSummary2569(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const eligibleSheet = ss.getSheetByName('Eligible_2569');
+    const requestSheet = ss.getSheetByName('LoanRequests_2569');
+    
+    if (!eligibleSheet) return [];
+
+    const eligibles = eligibleSheet.getDataRange().getDisplayValues().slice(1);
+    const requests = requestSheet ? requestSheet.getDataRange().getDisplayValues().slice(1) : [];
+    const submittedIds = new Set(requests.map(r => String(r[1]).trim()));
+
+    const result = eligibles.map(row => {
+      const stdId = String(row[0]).trim();
+      return {
+        studentId: stdId,
+        name: String(row[1]),
+        faculty: String(row[9]), 
+        gpa: row[12], 
+        credits: row[13],
+        status: submittedIds.has(stdId) ? 'Submitted' : 'Not Submitted'
+      };
+    });
+    return result;
+  } catch (e) {
+    return [];
+  }
+}
+
+function uploadAndImportOverGPACredits(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock(); 
+  let tempFileId = null;
+  try {
+    lock.waitLock(15000); 
+    
+    if (!data.content || typeof data.content !== 'string') {
+        return { success: false, message: 'รูปแบบข้อมูลไฟล์ไม่ถูกต้อง' };
+    }
+    
+    if (data.content.length > 7000000) {
+        return { success: false, message: 'ระบบความปลอดภัย: ไฟล์มีขนาดใหญ่เกินกว่าที่กำหนด (จำกัด 5MB)' };
+    }
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.content), data.mimeType, data.fileName);
+    const resource = { title: '[TEMP] Over GPA Upload', mimeType: MimeType.GOOGLE_SHEETS };
+    const tempFile = Drive.Files.create(resource, blob);
+    tempFileId = tempFile.id;
+    
+    const tempSS = SpreadsheetApp.openById(tempFileId);
+    const tempSheet = tempSS.getSheets()[0];
+    const allValues = tempSheet.getDataRange().getValues();
+
+    if (allValues.length < 2) return { success: false, message: 'ไฟล์ไม่มีข้อมูล' };
+
+    const updateMap = {};
+    for (let i = 1; i < allValues.length; i++) {
+        const row = allValues[i];
+        const stdId = secureInput(String(row[4]).trim()); 
+        if (stdId) {
+            let rawGpa = String(row[7]).replace(/[\r\n\t\s]+/g, '');
+            let matchGpa = rawGpa.match(/[0-9]+(\.[0-9]+)?/);
+            let cleanGpa = matchGpa ? matchGpa[0] : "0.00";
+
+            let rawCredits = String(row[8]).replace(/[\r\n\t\s]+/g, '');
+            let matchCredits = rawCredits.match(/[0-9]+(\.[0-9]+)?/);
+            let cleanCredits = matchCredits ? matchCredits[0] : "0";
+
+            updateMap[stdId] = { 
+                gpa: secureInput(cleanGpa),         
+                credits: secureInput(cleanCredits)  
+            };
+        }
+    }
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const targetSheet = ss.getSheetByName('OverEligible_2569');
+    const targetData = targetSheet.getDataRange().getValues();
+    let updateCount = 0;
+
+    for (let i = 1; i < targetData.length; i++) {
+        const targetStdId = String(targetData[i][0]).trim();
+        if (updateMap[targetStdId]) {
+            targetData[i][5] = updateMap[targetStdId].gpa;    
+            targetData[i][6] = updateMap[targetStdId].credits; 
+            updateCount++;
+        }
+    }
+
+    if (updateCount > 0) {
+        targetSheet.getRange(1, 1, targetData.length, targetData[0].length).setValues(targetData);
+        return { success: true, updateCount: updateCount, failedCount: Object.keys(updateMap).length - updateCount };
+    }
+    return { success: false, message: 'ไม่พบรหัสนักศึกษาที่ตรงกัน' };
+  } catch (e) { 
+    return { success: false, message: "ระบบอัปโหลดขัดข้อง กรุณาลองใหม่อีกครั้ง" }; 
+  } finally {
+    if (tempFileId) {
+      try { Drive.Files.remove(tempFileId); } catch (err) {}
+    }
+    lock.releaseLock();
+  }
+}
+
+function getOverAdminReportCSV(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+  const sheet = ss.getSheetByName('OverRequests_2569');
+  if (!sheet || sheet.getLastRow() < 2) return { success: false, message: 'ไม่มีข้อมูลคำร้อง' };
+  
+  const data = sheet.getDataRange().getDisplayValues();
+  let csvContent = "\uFEFF"; 
+  data.forEach(row => {
+    const cleanRow = row.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
+    csvContent += cleanRow.join(",") + "\n";
+  });
+  
+  return { success: true, csvData: csvContent };
+}
+
+function getOverLoanDashboardStats(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+  const eligibleSheet = ss.getSheetByName('OverEligible_2569');
+  const requestSheet = ss.getSheetByName('OverRequests_2569');
+
+  const eligibles = eligibleSheet ? eligibleSheet.getDataRange().getValues().slice(1) : [];
+  const requests = requestSheet ? requestSheet.getDataRange().getValues().slice(1) : [];
+
+  let stats = {
+    totalEligible: eligibles.length,
+    submitted: 0,
+    notSubmitted: 0,
+    gpaFail: 0,
+    creditFail: 0
+  };
+
+  const submittedIds = new Set(requests.map(r => String(r[1]).trim()));
+
+  eligibles.forEach(row => {
+    const stdId = String(row[0]).trim();
+    const gpa = parseFloat(row[5]) || 0;     
+    const credit = parseFloat(row[6]) || 0;  
+
+    if (submittedIds.has(stdId)) {
+      stats.submitted++;
+    } else {
+      stats.notSubmitted++;
+    }
+
+    if (gpa < 2.00) stats.gpaFail++;
+    if (credit < 12) stats.creditFail++;
+  });
+
+  return { success: true, ...stats };
+}
+
+function getOverLoanProfilesSummary(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const eligibleSheet = ss.getSheetByName('OverEligible_2569');
+    const requestSheet = ss.getSheetByName('OverRequests_2569');
+    
+    if (!eligibleSheet) return [];
+
+    const eligibles = eligibleSheet.getDataRange().getDisplayValues().slice(1);
+    const requests = requestSheet ? requestSheet.getDataRange().getDisplayValues().slice(1) : [];
+    const submittedIds = new Set(requests.map(r => String(r[1]).trim()));
+
+    const result = eligibles.map(row => {
+      const stdId = String(row[0]).trim();
+      return {
+        studentId: stdId,
+        name: String(row[1]),
+        faculty: String(row[3]),
+        gpa: row[5],
+        credits: row[6],
+        status: submittedIds.has(stdId) ? 'Submitted' : 'Not Submitted'
+      };
+    });
+    return result;
+  } catch (e) {
+    return [];
+  }
+}
+
+function checkStudentOverEligibility(studentId, token) {
+  verifyUserToken(studentId, token);
+  try {
+    const targetId = String(studentId).trim();
+    const cache = CacheService.getScriptCache();
+    const cachedResult = cache.get('over_elig_' + targetId);
+    if (cachedResult) {
+       return JSON.parse(cachedResult);
+    }
+
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    const eligibleSheet = ss.getSheetByName('OverEligible_2569');
+    const requestSheet = ss.getSheetByName('OverRequests_2569');
+
+    if (requestSheet && requestSheet.getLastRow() > 1) {
+      const requests = requestSheet.getDataRange().getDisplayValues();
+      for (let i = 1; i < requests.length; i++) {
+        if (String(requests[i][1]).trim() === targetId) {
+          const res = { 
+              status: 'submitted', 
+              data: { 
+                reqType: String(requests[i][3]),
+                livingAmount: requests[i][4], 
+                tuitionAmount: requests[i][5], 
+                remCredits: requests[i][6], 
+                gradYear: requests[i][7], 
+                submittedAt: requests[i][9] 
+              }
+          };
+          cache.put('over_elig_' + targetId, JSON.stringify(res), 300);
+          return res;
+        }
+      }
+    }
+
+    if (!eligibleSheet) {
+      return { status: 'not_found', message: 'ยังไม่มีฐานข้อมูลผู้มีสิทธิ์กู้เกินหลักสูตร หากมีข้อผิดพลาดกรุณาติดต่อสถานศึกษา' };
+    }
+
+    const eligibles = eligibleSheet.getDataRange().getDisplayValues();
+    let studentData = null;
+    for (let i = 1; i < eligibles.length; i++) {
+      if (String(eligibles[i][0]).trim() === targetId) { 
+          studentData = eligibles[i];
+          break; 
+      }
+    }
+
+    if (!studentData) {
+      return { status: 'not_found', message: 'ไม่พบรายชื่อของท่านในกลุ่มผู้กู้เกินหลักสูตร หากมีข้อผิดพลาดกรุณาติดต่อสถานศึกษา' };
+    }
+
+    const profiles = getData_(SHEET_NAMES.PROFILES);
+    const hasProfile = profiles.find(p => String(p.studentId).trim() === targetId);
+    if (!hasProfile) {
+      return { status: 'no_profile', message: 'ไม่พบข้อมูลประวัติในระบบ' };
+    }
+
+    const gpa = parseFloat(studentData[5]) || 0;
+    const credits = parseFloat(studentData[6]) || 0;
+    const isPassed = (gpa >= 2.00 && credits >= 12);
+    
+    const finalResult = {
+      status: 'eligible_check',
+      passed: isPassed,
+      studentInfo: { 
+        studentId: String(studentData[0]), 
+        name: String(studentData[1]), 
+        faculty: String(studentData[3]), 
+        curriculum: String(studentData[4]), 
+        gpa: gpa, 
+        credits: credits,
+        updatedAt: studentData[7] 
+      }
+    };
+
+    cache.put('over_elig_' + targetId, JSON.stringify(finalResult), 300); 
+    return finalResult;
+
+  } catch (e) {
+    return { status: 'not_found', message: 'เกิดข้อผิดพลาดของระบบ ไม่สามารถประมวลผลข้อมูลได้ในขณะนี้' };
+  }
+}
+
+function submitOverRequest(data) {
+  verifyUserToken(data.studentId, data.token); 
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOAN_SHEET_ID);
+    let sheet = ss.getSheetByName(SHEET_OVER_REQUESTS);
+    if (!sheet) { setupOverDatabase(); sheet = ss.getSheetByName(SHEET_OVER_REQUESTS); }
+
+    const targetId = String(data.studentId).trim();
+    const existing = sheet.getDataRange().getValues().find(r => String(r[1]).trim() === targetId);
+    if (existing) return { success: false, message: 'ท่านได้ยื่นคำร้องไปแล้ว' };
+
+    sheet.appendRow([
+        Utilities.getUuid(), 
+        targetId, 
+        secureInput(data.name), 
+        secureInput(data.reqType), 
+        secureInput(data.livingAmount), 
+        secureInput(data.tuitionAmount), 
+        secureInput(data.remCredits), 
+        secureInput(data.gradYear), 
+        'Pending', 
+        new Date().toISOString()
+    ]);
+    SpreadsheetApp.flush();
+    return { success: true };
+  } catch (e) { 
+    return { success: false, message: "ระบบยื่นคำร้องขัดข้อง ไม่สามารถดำเนินการได้ในขณะนี้" }; 
+  } finally { 
+    lock.releaseLock(); 
+  }
+}
+
+function uploadAndImportResignExcel(data, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock(); 
+  let tempFileId = null;
+  try {
+    lock.waitLock(15000);
+    if (!data.content || typeof data.content !== 'string') {
+        return { success: false, message: 'รูปแบบข้อมูลไฟล์ไม่ถูกต้อง' };
+    }
+    
+    if (data.content.length > 7000000) {
+        return { success: false, message: 'ระบบความปลอดภัย: ไฟล์มีขนาดใหญ่เกินกว่าที่กำหนด (จำกัด 5MB)' };
+    }
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(data.content), data.mimeType, data.fileName);
+    const resource = { title: '[TEMP] Resign Upload', mimeType: MimeType.GOOGLE_SHEETS };
+    const tempFile = Drive.Files.create(resource, blob);
+    tempFileId = tempFile.id;
+    
+    const tempSS = SpreadsheetApp.openById(tempFileId);
+    const tempSheet = tempSS.getSheets()[0];
+    const allValues = tempSheet.getDataRange().getValues();
+
+    if (allValues.length < 5) return { success: false, message: 'ไฟล์ข้อมูลน้อยเกินไป หรือไม่มีข้อมูลในแถวที่ 5' };
+
+    const dataRows = allValues.slice(4); 
+    const validRows = dataRows.filter(row => row[0] != "" && row[1] != ""); 
+
+    if (validRows.length === 0) return { success: false, message: 'ไม่พบข้อมูลในแถวที่ 5 ลงไป' };
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let targetSheet = ss.getSheetByName(SHEET_RESIGN_ELIGIBLE);
+    if (!targetSheet) { setupResignDatabase(); targetSheet = ss.getSheetByName(SHEET_RESIGN_ELIGIBLE); }
+
+    const existingIds = new Set();
+    const existingData = targetSheet.getDataRange().getValues();
+    for (let i = 1; i < existingData.length; i++) {
+        existingIds.add(String(existingData[i][0]).trim());
+    }
+
+    const timestamp = new Date().toISOString();
+    const finalData = [];
+
+    validRows.forEach(r => {
+      const stdId = secureInput(String(r[0]).trim()); 
+      if (!existingIds.has(stdId)) {
+          finalData.push([
+            stdId, 
+            secureInput(String(r[1])), 
+            secureInput(String(r[2])), 
+            secureInput(String(r[3])), 
+            secureInput(String(r[4])), 
+            secureInput(String(r[5])), 
+            secureInput(String(r[6])), 
+            secureInput(String(r[7])), 
+            secureInput(String(r[8])), 
+            secureInput(String(r[9])), 
+            secureInput(String(r[10])), 
+            secureInput(String(r[11])), 
+            timestamp
+          ]);
+          existingIds.add(stdId); 
+      }
+    });
+
+    if (finalData.length > 0) {
+      const lastRow = targetSheet.getLastRow();
+      targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
+      return { success: true, count: finalData.length, message: `บันทึกข้อมูลเพิ่มสำเร็จ ${finalData.length} รายการ (ข้ามข้อมูลที่ซ้ำ ${validRows.length - finalData.length} รายการ)` };
+    } else {
+      return { success: false, message: 'ไม่พบข้อมูลใหม่ (ข้อมูลทั้งหมดมีอยู่ในระบบแล้ว)' };
+    }
+
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    if (tempFileId) {
+      try { Drive.Files.remove(tempFileId); } catch (err) {}
+    }
+    lock.releaseLock(); 
+  }
+}
+
+function getResignDashboardStats(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_RESIGN_ELIGIBLE);
+  let count = 0;
+  if (sheet) {
+    count = sheet.getLastRow() - 1; 
+    if (count < 0) count = 0;
+  }
+  return { success: true, totalEligible: count };
+}
+
+function getResignAdminData(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    const eligibleSheet = ss.getSheetByName(SHEET_RESIGN_ELIGIBLE_DB);
+    let totalEligible = 0;
+    if (eligibleSheet) {
+      totalEligible = Math.max(0, eligibleSheet.getLastRow() - 1);
+    }
+
+    const requestSheet = ss.getSheetByName(SHEET_RESIGN_REQUESTS_DB);
+    let requestData = [];
+    
+    let typeMoveUni = 0;
+    let typeChangeFac = 0;
+    let typeQuit = 0;
+    let typeOther = 0;
+    
+    if (requestSheet && requestSheet.getLastRow() > 1) {
+      const rawData = requestSheet.getDataRange().getDisplayValues();
+      const headers = rawData[0].map(h => String(h).trim());
+
+      const colId = headers.indexOf('requestId') !== -1 ? headers.indexOf('requestId') : 0;
+      const colStudentId = headers.indexOf('studentId') !== -1 ? headers.indexOf('studentId') : 1;
+      const colName = headers.indexOf('name') !== -1 ? headers.indexOf('name') : 2;
+      const colType = headers.indexOf('resignType') !== -1 ? headers.indexOf('resignType') : 3;
+      const colDate = headers.indexOf('resignDate') !== -1 ? headers.indexOf('resignDate') : 4;
+      const colInst = headers.indexOf('newInstitution') !== -1 ? headers.indexOf('newInstitution') : 5;
+      const colFac = headers.indexOf('newFaculty') !== -1 ? headers.indexOf('newFaculty') : 6;
+      const colMajor = headers.indexOf('newMajor') !== -1 ? headers.indexOf('newMajor') : 7;
+      const colStatus = headers.indexOf('status') !== -1 ? headers.indexOf('status') : 8;
+      const colSub = headers.indexOf('submittedAt') !== -1 ? headers.indexOf('submittedAt') : 9;
+
+      const dataRows = rawData.slice(1); 
+
+      requestData = dataRows.map(row => {
+        const typeStr = String(row[colType]).trim(); 
+
+        if (typeStr.includes('ย้ายสถานศึกษา')) typeMoveUni++;
+        else if (typeStr.includes('ย้ายคณะ')) typeChangeFac++;
+        else if (typeStr.includes('ไม่ได้ศึกษาต่อ') || typeStr.includes('ลาออก')) typeQuit++;
+        else if (typeStr !== '') typeOther++;
+
+        return {
+          id: String(row[colId]),
+          studentId: String(row[colStudentId]),
+          name: String(row[colName]),
+          resignType: typeStr,
+          resignDate: String(row[colDate]),
+          newDetail: (row[colInst] || row[colFac]) ? `${row[colInst] || ''} ${row[colFac] || ''} ${row[colMajor] || ''}`.trim() : '-',
+          status: String(row[colStatus]) || 'Pending',
+          submittedAt: String(row[colSub])
+        };
+      });
+    }
+
+    const stats = {
+      eligible: totalEligible,
+      submitted: requestData.length,
+      pending: requestData.filter(r => r.status === 'Pending').length,
+      completed: requestData.filter(r => r.status === 'Completed').length,
+      typeMoveUni: typeMoveUni,     
+      typeChangeFac: typeChangeFac, 
+      typeQuit: typeQuit            
+    };
+
+    return {
+      success: true,
+      stats: stats,
+      data: requestData
+    };
+
+  } catch (error) {
+    return { success: false, message: 'ระบบดึงข้อมูลคำร้องขัดข้อง กรุณาลองใหม่อีกครั้ง' };
+  }
+}
+
+function updateResignRequestStatus(requestId, newStatus, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock(); 
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_RESIGN_REQUESTS_DB);
+    
+    if (!sheet) throw new Error("ไม่พบฐานข้อมูล " + SHEET_RESIGN_REQUESTS_DB);
+
+    const data = sheet.getDataRange().getValues();
+    let rowToUpdate = -1;
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(requestId)) {
+        rowToUpdate = i + 1; 
+        break;
+      }
+    }
+
+    if (rowToUpdate === -1) {
+      return { success: false, message: "ไม่พบรหัสคำร้องนี้ในระบบ" };
+    }
+
+    sheet.getRange(rowToUpdate, 9).setValue(newStatus);
+    SpreadsheetApp.flush();
+    return { success: true };
+
+  } catch (error) {
+    return { success: false, message: 'ระบบอัปเดตสถานะขัดข้อง กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function checkStudentResignStatus(studentId, token) {
+  verifyUserToken(studentId, token); 
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const eligibleSheet = ss.getSheetByName(SHEET_RESIGN_ELIGIBLE);
+  const requestSheet = ss.getSheetByName(SHEET_RESIGN_REQUESTS);
+  const targetId = String(studentId).trim();
+
+  if (requestSheet && requestSheet.getLastRow() > 1) {
+    const requests = requestSheet.getDataRange().getDisplayValues();
+    for (let i = 1; i < requests.length; i++) {
+      if (String(requests[i][1]).trim() === targetId) {
+        return { 
+          status: 'submitted', 
+          data: {
+            resignType: String(requests[i][3]),
+            submittedAt: String(requests[i][9])
+          }
+        };
+      }
+    }
+  }
+
+  if (!eligibleSheet) return { status: 'not_found', message: 'ไม่พบฐานข้อมูล' };
+  
+  const eligibles = eligibleSheet.getDataRange().getDisplayValues();
+  let studentData = null;
+  for (let i = 1; i < eligibles.length; i++) {
+    if (String(eligibles[i][0]).trim() === targetId) {
+      studentData = eligibles[i];
+      break;
+    }
+  }
+
+  if (!studentData) {
+    return { status: 'not_found', message: 'ไม่พบข้อมูลของท่านในรายชื่อผู้มีสิทธิ์แจ้งลาออก' };
+  }
+
+  return {
+    status: 'eligible',
+    info: {
+      studentId: String(studentData[0]),
+      name: String(studentData[1]),
+      faculty: String(studentData[9]),
+      curriculum: String(studentData[11]),
+      status: String(studentData[4])
+    }
+  };
+}
+
+function submitResignRequest(data) {
+  verifyUserToken(data.studentId, data.token); 
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName('ResignRequests');
+    if (!sheet) { setupResignDatabase(); sheet = ss.getSheetByName('ResignRequests'); }
+
+    const targetId = String(data.studentId).trim();
+    const existing = sheet.getDataRange().getValues().find(r => String(r[1]).trim() === targetId);
+    if (existing) return { success: false, message: 'ท่านได้ยื่นคำร้องไปแล้ว' };
+
+    sheet.appendRow([
+      Utilities.getUuid(),
+      targetId,
+      secureInput(data.name),
+      secureInput(data.resignType),
+      secureInput(data.resignDate),
+      secureInput(data.newInstitution),
+      secureInput(data.newFaculty),
+      secureInput(data.newMajor),
+      'Pending', 
+      new Date().toISOString()
+    ]);
+    
+    SpreadsheetApp.flush();
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: '500 Internal Server Error เกิดข้อผิดพลาดของระบบ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getAdminPetitions(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const ss = SpreadsheetApp.openById(EXTERNAL_PETITION_SHEET_ID);
+    const sheet = ss.getSheetByName('Petitions');
+    if (!sheet) return { success: false, message: 'ไม่พบฐานข้อมูล' };
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return { success: true, data: [] };
+
+    const headers = data[0].map(h => String(h).trim());
+    const result = [];
+
+    for (let i = data.length - 1; i >= 1; i--) {
+      const rowObj = { _rowIndex: i + 1 }; 
+      headers.forEach((header, index) => {
+        let cellValue = data[i][index];
+        if (cellValue instanceof Date) {
+          cellValue = cellValue.toISOString();
+        }
+        rowObj[header] = String(cellValue);
+      });
+      result.push(rowObj);
+    }
+    
+    return { success: true, data: result };
+  } catch (e) {
+    return { success: false, message: "ระบบดึงข้อมูลคำร้องขัดข้อง กรุณาลองใหม่อีกครั้ง" };
+  }
+}
+
+function updatePetitionStatus(rowIndex, status, note, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_PETITION_SHEET_ID);
+    const sheet = ss.getSheetByName('Petitions');
+    
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    let statusCol = headers.indexOf('สถานะ') + 1;
+    let noteCol = headers.indexOf('หมายเหตุเจ้าหน้าที่') + 1;
+
+    if (noteCol === 0) {
+      noteCol = headers.length + 1;
+      sheet.getRange(1, noteCol).setValue('หมายเหตุเจ้าหน้าที่');
+      sheet.getRange(1, noteCol).setFontWeight("bold").setBackground("#e3f2fd");
+    }
+
+    sheet.getRange(rowIndex, statusCol).setValue(String(status));
+    sheet.getRange(rowIndex, noteCol).setValue(secureInput(String(note)));
+    
+    SpreadsheetApp.flush();
+    return { success: true, message: 'อัปเดตสถานะเรียบร้อยแล้ว' };
+  } catch (e) {
+    return { success: false, message: "ระบบอัปเดตสถานะขัดข้อง กรุณาลองใหม่อีกครั้ง" };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getPetitionDownloadCSV(adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    const ss = SpreadsheetApp.openById(EXTERNAL_PETITION_SHEET_ID);
+    const sheet = ss.getSheetByName('Petitions');
+    if (!sheet) return { success: false, message: 'ไม่พบ Petitions' };
+
+    const data = sheet.getDataRange().getDisplayValues();
+    if (data.length < 1) return { success: false, message: 'ไม่มีข้อมูลในระบบ' };
+
+    let csvContent = "";
+    data.forEach(row => {
+      const cleanRow = row.map(cell => `"${String(cell).replace(/"/g, '""')}"`);
+      csvContent += cleanRow.join(",") + "\n";
+    });
+
+    return { 
+      success: true, 
+      csvData: csvContent, 
+      fileName: `Online_Petitions_Report_${new Date().toISOString().slice(0,10)}.csv` 
+    };
+  } catch (e) {
+    return { success: false, message: "ระบบสร้างไฟล์ดาวน์โหลดขัดข้อง กรุณาลองใหม่อีกครั้ง" };
+  }
+}
+
+function submitOnlinePetition(data) {
+  verifyUserToken(data.studentId, data.token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.openById(EXTERNAL_PETITION_SHEET_ID);
+    let sheet = ss.getSheetByName('Petitions');
+    if (!sheet) {
+      sheet = ss.insertSheet('Petitions');
+      sheet.appendRow(['วันที่ยื่นคำร้อง', 'รหัสนักศึกษา', 'ชื่อ-สกุล', 'ประเภทคำร้อง', 'เหตุผลประกอบ', 'สถานะ']);
+      sheet.getRange("A1:F1").setFontWeight("bold").setBackground("#e3f2fd");
+      sheet.setFrozenRows(1);
+    }
+
+    const typeMap = {
+      "1": "ขอลงทะเบียนปรับปรุงข้อมูลประวัติ (ไม่อยู่ในช่วงระยะเวลาที่กำหนด)",
+      "2": "ขอประมวลผลเกรดเฉลี่ยเเละหน่วยกิตจิตอาสาเพิ่มเติม (กรณีรอบ 1 ไม่ผ่าน)",
+      "3": "ยื่นคำร้องเรื่องอื่นๆผ่านระบบ"
+    };
+
+    const typeLabel = typeMap[data.type] || String(data.type);
+
+    sheet.appendRow([
+      new Date().toISOString(),
+      secureInput(data.studentId),
+      secureInput(data.name),
+      secureInput(typeLabel),
+      secureInput(data.reason),
+      'รอดำเนินการ'
+    ]);
+    
+    SpreadsheetApp.flush();
+    recordSystemLog(data.studentId, data.name, "ยื่นคำร้องออนไลน์: " + typeLabel, "Web App");
+    return { success: true, message: 'ส่งคำร้องเข้าสู่ระบบเรียบร้อยแล้ว' };
+    
+  } catch (e) {
+    return { success: false, message: 'ระบบขัดข้อง ไม่สามารถส่งคำร้องได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getMyPetitions(studentId, token) {
+  verifyUserToken(studentId, token); 
+  try {
+    const ss = SpreadsheetApp.openById(EXTERNAL_PETITION_SHEET_ID); 
+    const sheet = ss.getSheetByName('Petitions');
+    if (!sheet) return [];
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return []; 
+
+    const headers = data[0].map(h => String(h).trim()); 
+    const studentIdIndex = headers.indexOf('รหัสนักศึกษา');
+    
+    if (studentIdIndex === -1) {
+      return [];
+    }
+
+    const result = [];
+    
+    for (let i = data.length - 1; i >= 1; i--) {
+      const rowValue = String(data[i][studentIdIndex]).trim();
+      const searchId = String(studentId).trim();
+
+      if (rowValue === searchId) {
+        const rowObj = {};
+        
+        headers.forEach((header, index) => {
+          let cellValue = data[i][index];
+          if (cellValue instanceof Date) {
+             cellValue = cellValue.toISOString();
+          }
+          rowObj[header] = String(cellValue);
+        });
+        
+        rowObj['id'] = i + 1; 
+        result.push(rowObj);
+      }
+    }
+    
+    return result;
+
+  } catch (e) {
+    return [];
+  }
+}
+
+function getSystemMenuSettings() {
+  const props = PropertiesService.getScriptProperties();
+  const defaults = {
+    'menu_userProfile': 'true',
+    'menu_userActivity': 'true',
+    'menu_userQueue': 'true',
+    'menu_loan2569': 'true',
+    'menu_userResign': 'true',
+    'menu_userPetition': 'true',
+    'menu_overLoan': 'true', 
+    
+    'pet_type1_open': 'true',
+    'pet_type2_open': 'true',
+    'pet_type3_open': 'true'
+  };
+  
+  const saved = props.getProperties();
+  return { success: true, ...defaults, ...saved };
+}
+
+function saveSystemMenuSettings(settings, adminId, token) {
+  verifyAdminToken(adminId, token);
+  try {
+    PropertiesService.getScriptProperties().setProperties(settings);
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: 'บันทึกการตั้งค่าล้มเหลว กรุณาลองใหม่อีกครั้ง' };
+  }
+}
+
+function searchStudentForSpecialAccess(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const users = getData_(SHEET_NAMES.USERS);
+  const student = users.find(u => String(u.studentId).trim() === String(studentId).trim() && String(u.role) !== 'admin');
+
+  if (student) {
+    return {
+      success: true,
+      student: {
+        studentId: String(student.studentId),
+        name: `${student.prefix || ''}${student.firstName} ${student.lastName}`.trim(),
+        faculty: String(student.faculty)
+      }
+    };
+  }
+  return { success: false, message: 'ไม่พบรหัสนักศึกษานี้ หรือเป็นบัญชีผู้ดูแลระบบ' };
+}
+
+function grantSpecialMenuAccess(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(SHEET_SPECIAL_ACCESS);
+
+    if (!sheet) {
+      sheet = ss.insertSheet(SHEET_SPECIAL_ACCESS);
+      sheet.appendRow(['studentId', 'name', 'faculty', 'timestamp']);
+      sheet.getRange("A1:D1").setFontWeight("bold").setBackground("#fff9c4");
+      sheet.setFrozenRows(1);
+      sheet.getRange("A:A").setNumberFormat("@"); 
+    }
+
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() === String(studentId).trim()) {
+        return { success: false, message: 'นักศึกษาคนนี้ได้รับสิทธิ์อยู่แล้ว' };
+      }
+    }
+
+    const users = getData_(SHEET_NAMES.USERS);
+    const user = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+    if (!user) return { success: false, message: 'ไม่พบข้อมูลผู้ใช้งานในระบบ' };
+
+    const name = `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim();
+
+    sheet.appendRow([
+      String(studentId).trim(),
+      name,
+      String(user.faculty || '-'),
+      new Date().toISOString()
+    ]);
+
+    SpreadsheetApp.flush();
+    return { success: true };
+  } catch (e) {
+    return { success: false, message: 'ระบบขัดข้อง ไม่สามารถมอบสิทธิ์ได้ในขณะนี้' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getSpecialAccessList(adminId, token) {
+  verifyAdminToken(adminId, token);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_SPECIAL_ACCESS);
+  if (!sheet) return [];
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return [];
+
+  const list = [];
+  for (let i = 1; i < data.length; i++) {
+    list.push({
+      studentId: String(data[i][0]),
+      name: String(data[i][1]),
+      faculty: String(data[i][2]),
+      timestamp: String(data[i][3])
+    });
+  }
+  return list.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+}
+
+function revokeSpecialMenuAccess(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_SPECIAL_ACCESS);
+    if (!sheet) return { success: false, message: 'ไม่พบฐานข้อมูลสิทธิ์พิเศษ' };
+
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() === String(studentId).trim()) {
+        sheet.deleteRow(i + 1);
+        SpreadsheetApp.flush();
+        return { success: true };
+      }
+    }
+    return { success: false, message: 'ไม่พบข้อมูลสิทธิ์ของรหัสนักศึกษานี้' };
+  } catch (e) {
+    return { success: false, message: 'ระบบขัดข้อง ไม่สามารถเพิกถอนสิทธิ์ได้ในขณะนี้' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getStudentMenuPermissions(studentId, token) {
+  if (studentId && token) {
+    verifyUserToken(studentId, token);
+  }
+
+  const globalSettingsRes = getSystemMenuSettings();
+  let hasSpecialAccess = false;
+
+  if (studentId) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_SPECIAL_ACCESS);
+    if (sheet) {
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][0]).trim() === String(studentId).trim()) {
+          hasSpecialAccess = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0); 
+
+  const menusToCheck = [
+    'menu_userProfile', 'menu_userActivity', 'menu_userQueue', 
+    'menu_loan2569', 'menu_userResign', 'menu_userPetition', 'menu_overLoan',
+    'pet_type1_open', 'pet_type2_open', 'pet_type3_open'
+  ];
+  
+  menusToCheck.forEach(menu => {
+    if (globalSettingsRes[menu] === 'false') return;
+
+    let startDateStr = globalSettingsRes['date_start_' + menu];
+    let endDateStr = globalSettingsRes['date_end_' + menu];
+    
+    if (menu.startsWith('pet_type')) {
+        startDateStr = globalSettingsRes['date_start_' + menu];
+        endDateStr = globalSettingsRes['date_end_' + menu];
+    }
+
+    let isWithinDate = true;
+
+    if (startDateStr) {
+      const startDate = new Date(startDateStr);
+      startDate.setHours(0, 0, 0, 0);
+      if (today < startDate) isWithinDate = false; 
+    }
+
+    if (endDateStr) {
+      const endDate = new Date(endDateStr);
+      endDate.setHours(23, 59, 59, 999); 
+      if (today > endDate) isWithinDate = false; 
+    }
+
+    if (!isWithinDate) {
+      globalSettingsRes[menu] = 'false';
+    }
+  });
+
+  return {
+    success: true,
+    globalSettings: globalSettingsRes,
+    hasSpecialAccess: hasSpecialAccess
+  };
+}
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      throw new Error("ไม่มีข้อมูลส่งมาจากหน้าเว็บ");
+    }
+
+    const data = JSON.parse(e.postData.contents);
+    const action = String(data.action);
+    let result;
+
+    if (action === "login") { result = login(data.studentId, data.password, data.ipAddress); } 
+    else if (action === "signUp") { result = signUp(data.userData); } 
+    else if (action === "verifyUserForReset") { result = verifyUserForReset(data.studentId, data.phone, data.idCard); } 
+    else if (action === "resetPassword") { result = resetPassword(data); } 
+    else if (action === "getProfile") { result = getProfile(data.studentId, data.token); } 
+    else if (action === "saveProfile") { result = saveProfile(data.profileData, data.token); } 
+    else if (action === "uploadProfileImage") { result = uploadProfileImage(data); } 
+    else if (action === "getStudentMenuPermissions") { result = getStudentMenuPermissions(data.studentId, data.token); }
+    else if (action === "getActivities") { result = getActivities(data.mode, data.studentId, data.token); } 
+    else if (action === "registerStudentActivity") { result = registerStudentActivity(data.studentId, data.activityId, data.token); }
+    else if (action === "getQueueSlots") { result = getQueueSlots(data.role, data.studentId, data.token); } 
+    else if (action === "bookQueue") { result = bookQueue(data.studentId, data.slotId, data.token); } 
+    else if (action === "getMyQueue") { result = getMyQueue(data.studentId, data.token); } 
+    else if (action === "cancelQueue") { result = cancelQueue(data.studentId, data.token); }
+    else if (action === "checkStudentEligibility2569") { result = checkStudentEligibility2569(data.studentId, data.token); } 
+    else if (action === "submitLoanRequest2569") { result = submitLoanRequest2569(data); } 
+    else if (action === "checkStudentOverEligibility") { result = checkStudentOverEligibility(data.studentId, data.token); } 
+    else if (action === "submitOverRequest") { result = submitOverRequest(data); }
+    else if (action === "checkStudentResignStatus") { result = checkStudentResignStatus(data.studentId, data.token); } 
+    else if (action === "submitResignRequest") { result = submitResignRequest(data); } 
+    else if (action === "submitOnlinePetition") { result = submitOnlinePetition(data); } 
+    else if (action === "getMyPetitions") { result = getMyPetitions(data.studentId, data.token); }
+    else if (action === "getDashboardStats") { result = getDashboardStats(data.adminId, data.token); }
+    else if (action === "searchUsersBackend") { result = searchUsersBackend(data.query, data.adminId, data.token); }
+    else if (action === "createUser") { result = createUser(data.userData, data.adminId, data.token); }
+    else if (action === "updateUser") { result = updateUser(data.userId, data.updatedData || data, data.adminId, data.token); }
+    else if (action === "deleteUser") { result = deleteUser(data.userId, data.adminId, data.token); }
+    else if (action === "deleteMultipleUsers") { result = deleteMultipleUsers(data.userIds, data.adminId, data.token); }
+    else if (action === "checkDuplicateAccounts") { result = checkDuplicateAccounts(data.adminId, data.token); }
+    else if (action === "getSuspendedUsers") { result = getSuspendedUsers(data.adminId, data.token); }
+    else if (action === "getProfileSummaries") { result = getProfileSummaries(data.adminId, data.token); }
+    else if (action === "searchProfilesBackend") { result = searchProfilesBackend(data.query, data.adminId, data.token); }
+    else if (action === "getStudentImageReport") { result = getStudentImageReport(data.adminId, data.token); }
+    else if (action === "getProfileImageHistory") { result = getProfileImageHistory(data.studentId, data.adminId, data.token); }
+    else if (action === "createActivity") { result = createActivity(data, data.adminId, data.token); }
+    else if (action === "updateActivity") { result = updateActivity(data, data.adminId, data.token); }
+    else if (action === "toggleActivityStatus") { result = toggleActivityStatus(data.id, data.status, data.adminId, data.token); }
+    else if (action === "deleteActivity") { result = deleteActivity(data.id, data.adminId, data.token); }
+    else if (action === "createQueueSlot") { result = createQueueSlot(data, data.adminId, data.token); }
+    else if (action === "updateQueueSlot") { result = updateRow_("QueueSlots", data.id, {date: data.date, time: data.time, quota: data.quota, status: data.status}); }
+    else if (action === "toggleQueueStatus") { result = toggleQueueStatus(data.id, data.status, data.adminId, data.token); }
+    else if (action === "deleteQueueSlot") { result = deleteQueueSlot(data.id, data.adminId, data.token); }
+    else if (action === "getQueueSlotOptions") { result = getQueueSlotOptions(data.adminId, data.token); }
+    else if (action === "getQueueAttendees") { result = getQueueAttendees(data.date, data.time, data.adminId, data.token); }
+    else if (action === "getLoanDashboardStats2569") { result = getLoanDashboardStats2569(data.adminId, data.token); }
+    else if (action === "uploadAndImportExcel") { result = uploadAndImportExcel(data, data.adminId, data.token); }
+    else if (action === "uploadAndImportGPACredits") { result = uploadAndImportGPACredits(data, data.adminId, data.token); }
+    else if (action === "adminGetLoanInfo") { result = adminGetLoanInfo(data.studentId, data.adminId, data.token); }
+    else if (action === "adminSaveLoanRequest") { result = adminSaveLoanRequest(data, data.adminId, data.token); }
+    else if (action === "adminDeleteLoanRequest") { result = adminDeleteLoanRequest(data.studentId, data.adminId, data.token); }
+    else if (action === "getAdminReportCSV") { result = getAdminReportCSV(data.reportType, data.faculty, data.adminId, data.token); }
+    else if (action === "getOverLoanDashboardStats") { result = getOverLoanDashboardStats(data.adminId, data.token); }
+    else if (action === "uploadAndImportOverExcel") { result = uploadAndImportOverExcel(data, data.adminId, data.token); }
+    else if (action === "uploadAndImportOverGPACredits") { result = uploadAndImportOverGPACredits(data, data.adminId, data.token); }
+    else if (action === "getOverLoanProfilesSummary") { result = getOverLoanProfilesSummary(data.adminId, data.token); }
+    else if (action === "getOverAdminReportCSV") { result = getOverAdminReportCSV(data.adminId, data.token); }
+    else if (action === "getResignDashboardStats") { result = getResignDashboardStats(data.adminId, data.token); }
+    else if (action === "uploadAndImportResignExcel") { result = uploadAndImportResignExcel(data, data.adminId, data.token); }
+    else if (action === "getResignAdminData") { result = getResignAdminData(data.adminId, data.token); }
+    else if (action === "updateResignRequestStatus") { result = updateResignRequestStatus(data.requestId, data.status, data.adminId, data.token); }
+    else if (action === "getAdminPetitions") { result = getAdminPetitions(data.adminId, data.token); }
+    else if (action === "updatePetitionStatus") { result = updatePetitionStatus(data.rowIndex, data.status, data.note, data.adminId, data.token); }
+    else if (action === "getPetitionDownloadCSV") { result = getPetitionDownloadCSV(data.adminId, data.token); }
+    else if (action === "getSystemMenuSettings") { result = getSystemMenuSettings(); }
+    else if (action === "saveSystemMenuSettings") { result = saveSystemMenuSettings(data.settings, data.adminId, data.token); }
+    else if (action === "searchStudentForSpecialAccess") { result = searchStudentForSpecialAccess(data.studentId, data.adminId, data.token); }
+    else if (action === "grantSpecialMenuAccess") { result = grantSpecialMenuAccess(data.studentId, data.adminId, data.token); }
+    else if (action === "getSpecialAccessList") { result = getSpecialAccessList(data.adminId, data.token); }
+    else if (action === "revokeSpecialMenuAccess") { result = revokeSpecialMenuAccess(data.studentId, data.adminId, data.token); }
+    else if (action === "getLoanProfilesSummary2569") { result = getLoanProfilesSummary2569(data.adminId, data.token); }
+    else if (action === "checkStudentForVerification") { result = checkStudentForVerification(data.studentId, data.adminId, data.token); }
+    else if (action === "submitIdentityVerification") { result = submitIdentityVerification(data.studentId, data.idCard, data.adminId, data.token); }
+    else if (action === "adminForceResetPassword") { result = adminForceResetPassword(data.studentId, data.adminId, data.token); }
+    else if (action === "adminUnlockAccount") { result = adminUnlockAccount(data.studentId, data.adminId, data.token); }
+    else {
+      throw new Error("ระบบหลังบ้านไม่รู้จักคำสั่ง (Action): " + action);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify(result))
+                         .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ success: false, message: err.message }))
+                         .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function recordSystemLog(studentId, name, action, ipAddress) {
+  try {
+    if (!EXTERNAL_LOG_SHEET_ID) return;
+    
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOG_SHEET_ID);
+    let sheet = ss.getSheetByName('SystemLogs');
+    
+    if (!sheet) {
+      sheet = ss.insertSheet('SystemLogs');
+      sheet.appendRow(['วันที่', 'เวลา', 'รหัสนักศึกษา', 'ชื่อ-สกุล', 'การกระทำ (Action)', 'IP Address']);
+      sheet.getRange("A1:F1").setFontWeight("bold").setBackground("#f3f3f3");
+      sheet.setFrozenRows(1);
+    }
+
+    const now = new Date();
+    const dateStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd/MM/yyyy");
+    const timeStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "HH:mm:ss");
+    sheet.appendRow([
+        dateStr, 
+        timeStr, 
+        String(studentId || '-'), 
+        String(name || '-'), 
+        String(action || '-'), 
+        String(ipAddress || 'Unknown')
+    ]);
+    
+    
+  } catch (e) {
+  }
+}
+
+function logSuspiciousActivity(studentId, action, deviceInfo) {
+  try {
+    if (!EXTERNAL_LOG_SHEET_ID) return;
+    const ss = SpreadsheetApp.openById(EXTERNAL_LOG_SHEET_ID); 
+    let sheet = ss.getSheetByName('SecurityAlerts'); 
+    
+    if (!sheet) {
+      sheet = ss.insertSheet('SecurityAlerts');
+      sheet.appendRow(['วันที่', 'เวลา', 'รหัสนักศึกษา', 'ชื่อ-สกุล', 'การกระทำ (Action)', 'ข้อมูลเพิ่มเติม']);
+      sheet.getRange("A1:F1").setFontWeight("bold").setBackground("#ffebee"); 
+      sheet.setFrozenRows(1);
+    }
+
+    const now = new Date();
+    const dateStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd/MM/yyyy");
+    const timeStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "HH:mm:ss");
+
+    let studentName = 'ไม่ทราบชื่อ/ไม่ได้ Login';
+    try {
+        if (studentId && String(studentId).trim() !== 'Unknown') {
+          const users = getData_(SHEET_NAMES.USERS);
+          const user = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+          if (user) {
+            studentName = `${user.prefix || ''}${user.firstName || ''} ${user.lastName || ''}`.trim();
+          }
+        }
+    } catch(nameErr) {
+        studentName = 'หาชื่อไม่พบ (Error)';
+    }
+
+    const safeStudentId = studentId ? String(studentId) : '-';
+    const safeAction = action ? `⚠️ แจ้งเตือน: ${String(action)}` : '⚠️ แจ้งเตือน: ไม่ระบุข้อมูล';
+    const safeDeviceInfo = deviceInfo ? String(deviceInfo) : '-';
+    
+    sheet.appendRow([dateStr, timeStr, safeStudentId, studentName, safeAction, safeDeviceInfo]);
+    
+    
+  } catch (e) {
+  }
+}
+
+function checkStudentForVerification(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+
+  const users = getData_(SHEET_NAMES.USERS);
+  const profiles = getData_(SHEET_NAMES.PROFILES);
+  
+  const user = users.find(u => String(u.studentId).trim() === String(studentId).trim() && String(u.role) !== 'admin');
+  if (!user) return { success: false, message: 'ไม่พบบัญชีผู้ใช้งานนักศึกษานี้ในระบบ' };
+  
+  const profile = profiles.find(p => String(p.studentId).trim() === String(studentId).trim());
+  const hasProfile = !!profile;
+  const updatedAt = profile && profile.updatedAt ? profile.updatedAt : '-';
+  
+  let isVerified = false;
+  let foundIdCard = '-'; 
+  
+  try {
+    const extSS = SpreadsheetApp.openById(EXTERNAL_ID_DATABASE_SHEET_ID);
+    const idSheet = extSS.getSheetByName('ID_Database');
+    
+    if (idSheet) {
+      const idData = idSheet.getDataRange().getDisplayValues();
+      for (let i = 0; i < idData.length; i++) {
+        if (String(idData[i][0]).trim() === String(studentId).trim()) {
+          isVerified = true;
+          foundIdCard = String(idData[i][1]).trim(); 
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    return { success: false, message: 'ระบบเชื่อมต่อฐานข้อมูลบัตรประชาชนขัดข้อง' };
+  }
+  
+  return {
+    success: true,
+    isVerified: isVerified,
+    data: {
+      studentId: user.studentId,
+      name: `${user.prefix || ''}${user.firstName} ${user.lastName}`.trim(),
+      phone: user.phone || 'ไม่พบข้อมูลเบอร์โทร',
+      idCard: foundIdCard,
+      hasProfile: hasProfile,
+      updatedAt: updatedAt,
+      profileImage: profile && profile.profileImage ? profile.profileImage : (user.profileImage || ''),
+      status: user.status || 'active' 
+    }
+  };
+}
+
+
+function adminUnlockAccount(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const users = getData_(SHEET_NAMES.USERS);
+    const targetUser = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+    
+    if (targetUser) {
+      updateRow_(SHEET_NAMES.USERS, targetUser.id, { status: 'active' });
+      return { success: true, message: 'ปลดล็อกบัญชีสำเร็จ ผู้ใช้งานสามารถเข้าระบบได้ตามปกติ' };
+    } else {
+      return { success: false, message: 'ไม่พบบัญชีผู้ใช้งานในระบบ' };
+    }
+  } catch(e) {
+    return { success: false, message: 'เกิดข้อผิดพลาด: ' + e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function submitIdentityVerification(studentId, idCard, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  
+  try {
+    lock.waitLock(10000);
+    
+    const extSS = SpreadsheetApp.openById(EXTERNAL_ID_DATABASE_SHEET_ID);
+    let idSheet = extSS.getSheetByName('ID_Database');
+    
+    if (!idSheet) {
+      idSheet = extSS.insertSheet('ID_Database');
+      idSheet.appendRow(['studentId', 'idCard', 'timestamp']);
+      idSheet.getRange("A1:C1").setFontWeight("bold").setBackground("#e3f2fd");
+      idSheet.setFrozenRows(1);
+    }
+    
+    const idData = idSheet.getDataRange().getDisplayValues();
+    for (let i = 1; i < idData.length; i++) {
+      if (String(idData[i][0]).trim() === String(studentId).trim()) {
+        return { success: false, message: 'รหัสนักศึกษานี้ได้ยืนยันตัวตนเรียบร้อยแล้ว' };
+      }
+    }
+    
+    idSheet.appendRow([String(studentId).trim(), String(idCard).trim(), new Date().toISOString()]);
+    
+    const users = getData_(SHEET_NAMES.USERS);
+    const targetUser = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+    
+    if (targetUser) {
+      const freshSalt = Utilities.getUuid();
+      const newPasswordHash = hashPassword(String(idCard).trim(), freshSalt);
+      updateRow_(SHEET_NAMES.USERS, targetUser.id, {
+        password: newPasswordHash,
+        salt: freshSalt
+      });
+    }
+    
+    SpreadsheetApp.flush();
+    return { success: true, message: 'บันทึกยืนยันตัวตนสำเร็จ ระบบได้รีเซ็ตรหัสผ่านเป็นเลขบัตร ปชช. แล้ว' };
+  } catch (e) {
+    return { success: false, message: 'เกิดข้อผิดพลาดในการบันทึกฐานข้อมูลภายนอก (โปรดตรวจสอบการอนุญาตเข้าถึงไฟล์)' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function adminForceResetPassword(studentId, adminId, token) {
+  verifyAdminToken(adminId, token);
+  const lock = LockService.getScriptLock();
+  
+  try {
+    lock.waitLock(10000);
+    
+    const extSS = SpreadsheetApp.openById(EXTERNAL_ID_DATABASE_SHEET_ID);
+    const idSheet = extSS.getSheetByName('ID_Database');
+    if (!idSheet) return { success: false, message: 'ไม่พบฐานข้อมูลบัตรประชาชน' };
+    
+    const idData = idSheet.getDataRange().getDisplayValues();
+    let idCard = null;
+    for (let i = 0; i < idData.length; i++) {
+      if (String(idData[i][0]).trim() === String(studentId).trim()) {
+        idCard = String(idData[i][1]).trim();
+        break;
+      }
+    }
+    
+    if (!idCard) return { success: false, message: 'นักศึกษายังไม่ได้ยืนยันตัวตน ไม่มีข้อมูลเลขบัตร ปชช. ในระบบ' };
+    
+    const users = getData_(SHEET_NAMES.USERS);
+    const targetUser = users.find(u => String(u.studentId).trim() === String(studentId).trim());
+    
+    if (targetUser) {
+      const freshSalt = Utilities.getUuid();
+      const newPasswordHash = hashPassword(idCard, freshSalt);
+      updateRow_(SHEET_NAMES.USERS, targetUser.id, {
+        password: newPasswordHash,
+        salt: freshSalt
+      });
+      return { success: true, message: 'รีเซ็ตรหัสผ่านเป็นเลขบัตรประจำตัวประชาชน สำเร็จ' };
+    } else {
+      return { success: false, message: 'ไม่พบบัญชีผู้ใช้งานในระบบ' };
+    }
+  } catch (e) {
+    return { success: false, message: 'เกิดข้อผิดพลาดของระบบ: ' + e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// 1. ให้สิทธิ์
+function grantSpecialLoanAccess(studentId, adminId, token) {
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    const users = getData_(Users); 
+    const targetUser = users.find(u => String(u.studentId) === String(studentId));
+    
+    if (!targetUser) return { success: false, message: 'ไม่พบรหัสนักศึกษานี้ในระบบ' };
+    
+    const accessData = {
+      studentId: studentId,
+      name: `${targetUser.firstName} ${targetUser.lastName}`.trim(),
+      timestamp: new Date().toISOString()
+    };
+    
+
+    appendRow_('SPECIAL_LOAN_ACCESS', accessData); 
+
+    return { success: true, message: 'บันทึกสิทธิ์สำเร็จ' };
+  } catch(e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function revokeSpecialLoanAccess(studentId, adminId, token) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    const accessList = getData_('SPECIAL_LOAN_ACCESS'); 
+    const target = accessList.find(a => String(a.studentId) === String(studentId));
+    
+    if (target) {
+      deleteRow_('SPECIAL_LOAN_ACCESS', target.id); 
+      return { success: true, message: 'ลบสิทธิ์สำเร็จ' };
+    }
+    return { success: false, message: 'ไม่พบสิทธิ์ของนักศึกษานี้' };
+  } catch(e) {
+    return { success: false, message: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getSpecialLoanAccessList(adminId, token) {
+  try {
+    const accessList = getData_('SPECIAL_LOAN_ACCESS'); 
+    return accessList.map(a => ({
+      studentId: a.studentId,
+      name: a.name,
+      timestamp: a.timestamp
+    }));
+  } catch(e) {
+    return [];
+  }
+}
+
+function checkHasSpecialLoanAccess(studentId) {
+  try {
+    const accessList = getData_('SPECIAL_LOAN_ACCESS'); 
+    const found = accessList.find(a => String(a.studentId) === String(studentId));
+    return !!found; 
+  } catch(e) {
+    return false;
+  }
+}
